@@ -405,9 +405,11 @@ resource "azurerm_postgresql_flexible_server_configuration" "extensions" {
 
 resource "azurerm_managed_redis" "main" {
   name                = "${local.name}-redis"
-  location            = data.azurerm_resource_group.main.location
+  location            = coalesce(var.redis_location, data.azurerm_resource_group.main.location)
   resource_group_name = data.azurerm_resource_group.main.name
   sku_name            = var.redis_sku_name
+  # Changing this forces replacement.
+  high_availability_enabled = var.redis_high_availability_enabled
 
   default_database {
     client_protocol = "Encrypted"

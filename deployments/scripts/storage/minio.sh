@@ -98,21 +98,42 @@ fi
 #    where a prior run left a pod stuck Terminating (e.g. CNI plugin errors
 #    blocking sandbox teardown) — the fixed name approach + delete-first
 #    still hangs there because force-delete-on-stuck isn't a path we can
-#    silently take from inside an automation. `--rm` reaps the new pod after
-#    `mc` exits. `timeout` guards against stuck image pull / Pending-forever
-#    scheduling.
+#    silently take from inside an automation.
+#    Deliberately NOT `kubectl run -i`: attaching races a container that exits
+#    in well under a second, and kubectl's log fallback then races pod
+#    teardown — both lose intermittently and report failure even though the
+#    bucket was created. Run detached, poll for a terminal phase, then read
+#    the logs. (`--rm` isn't available without `-i`, hence the explicit
+#    delete.)
 BUCKET_SETUP_TIMEOUT="${BUCKET_SETUP_TIMEOUT:-300}"
 BUCKET_SETUP_POD="minio-bucket-setup-$RANDOM-$RANDOM"
 echo "[INFO] Ensuring MinIO bucket $MINIO_BUCKET exists (helper pod: $BUCKET_SETUP_POD)"
-timeout "$BUCKET_SETUP_TIMEOUT" \
-  $KUBECTL run "$BUCKET_SETUP_POD" --rm -i --restart=Never \
+$KUBECTL run "$BUCKET_SETUP_POD" --restart=Never --attach=false \
     --namespace="$MINIO_NAMESPACE" \
     --image=minio/mc:latest --command -- \
     /bin/sh -c "
         mc alias set local $MINIO_ENDPOINT_URL '$MINIO_USER' '$MINIO_PASS' >/dev/null && \
         mc mb --ignore-existing local/$MINIO_BUCKET && \
         echo 'Bucket ready: $MINIO_BUCKET'
-    " || { echo "[ERROR] mc bucket setup failed"; exit 1; }
+    " >/dev/null
+
+bucket_setup_phase=""
+bucket_setup_deadline=$(( $(date +%s) + BUCKET_SETUP_TIMEOUT ))
+while [ "$(date +%s)" -lt "$bucket_setup_deadline" ]; do
+    bucket_setup_phase=$($KUBECTL get pod "$BUCKET_SETUP_POD" --namespace="$MINIO_NAMESPACE" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    case "$bucket_setup_phase" in Succeeded|Failed) break ;; esac
+    sleep 2
+done
+
+$KUBECTL logs "$BUCKET_SETUP_POD" --namespace="$MINIO_NAMESPACE" 2>/dev/null || true
+$KUBECTL delete pod "$BUCKET_SETUP_POD" --namespace="$MINIO_NAMESPACE" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
+if [ "$bucket_setup_phase" != "Succeeded" ]; then
+    echo "[ERROR] mc bucket setup failed (pod phase: ${bucket_setup_phase:-timed out after ${BUCKET_SETUP_TIMEOUT}s})"
+    exit 1
+fi
 
 # 3. Create 3 K8s Secrets, one per workflow_* credential reference.
 create_workflow_cred_secrets \
