@@ -71,6 +71,57 @@ OSMO services write logs to standard streams for collection by the platform log 
 | `services.configs.enabled` | Enable ConfigMap-backed dynamic configuration | `false` |
 | `services.configs.extraAnnotations` | Annotations on the generated configs ConfigMap (e.g., ArgoCD sync options) | `{}` |
 
+### Self-hosted MCP service
+
+The optional MCP workload exposes predefined OSMO operations to compatible
+native or desktop MCP clients. The Gateway authenticates and authorizes every
+`/mcp` request, and the MCP service relays the unchanged caller bearer through
+the same Gateway for each mapped OSMO API request. The second Gateway pass
+applies the API-specific action; `mcp:Access` alone grants no API permission.
+
+`services.mcp.resourceUrl` is the single source of truth for the public MCP
+resource and the outbound Gateway origin. It must be an externally reachable
+HTTPS URL with the exact `/mcp` path. For example,
+`https://osmo.example.com/mcp` produces the fixed outbound origin
+`https://osmo.example.com`. The MCP pod must be able to resolve and reach that
+public origin, and operators must ensure its DNS and routing lead to this
+release's Gateway. Derivation removes a second independently configured
+destination, but it cannot validate external DNS.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `services.mcp.enabled` | Deploy the MCP workload and Gateway routes. | `false` |
+| `services.mcp.resourceUrl` | Canonical public HTTPS MCP URL ending in exact `/mcp`; also determines the fixed outbound Gateway origin. | `""` |
+| `services.mcp.authorizationServers` | OAuth/OIDC issuer identifiers advertised in protected-resource metadata. At least one is required when enabled. | `[]` |
+| `services.mcp.scopes` | OAuth scopes advertised in protected-resource metadata. | `[]` |
+| `services.mcp.allowedOrigins` | Exact browser origins permitted on `/mcp`; native clients normally omit `Origin`. | `[]` |
+| `services.mcp.requestTimeoutSeconds` | Total timeout for each MCP-initiated Gateway request, from 1 through 60 seconds. | `10` |
+| `services.mcp.replicas` | Number of stateless MCP replicas. | `1` |
+| `services.mcp.extraEnv` | Additional non-managed environment variables. It cannot override MCP host, port, Gateway origin, or request timeout. | `[]` |
+
+Enabling MCP always renders an ingress NetworkPolicy whose allow rule selects
+only this release's Gateway Envoy pods, even when
+`gateway.networkPolicies.enabled` is false for other upstreams. This is
+required because MCP trusts the identity context created by Gateway.
+NetworkPolicies require enforcement by the cluster CNI and are additive, so
+operators must also ensure no other policy grants MCP ingress. The pod does
+not mount a service-account token, and the chart creates no MCP credential
+Secret. Gateway-to-MCP TLS continues to use the shared `gateway.tls`
+configuration described below.
+
+The external MCP exposes a 26-tool catalog with fixed API routes and no
+caller-selected origin, method, route, or headers. See the
+[external MCP tool plan](../../../src/service/mcp/TOOLS.md) for its exact
+contracts and API mappings. MCP health probes do not call these APIs; a
+tool-level authentication, authorization, timeout, or dependency error does
+not by itself make the pod unhealthy.
+
+Run the enabled and disabled rendering checks locally with:
+
+```bash
+bash deployments/charts/service/ci/validate-mcp-chart.sh
+```
+
 ### Database Migration Settings (pgroll)
 
 | Parameter | Description | Default |
@@ -425,7 +476,7 @@ The chart does not create Redis credentials. Secret controllers such as External
 
 #### Gateway → Upstream TLS
 
-Traffic between the Envoy gateway and the upstream services (`osmo-service`, `osmo-router`, `osmo-agent`, `osmo-logger`) is encrypted by default. The UI intentionally stays on plain HTTP behind NetworkPolicy — Next.js does not natively serve TLS.
+Traffic between the Envoy gateway and the upstream services (`osmo-service`, `osmo-router`, `osmo-agent`, `osmo-logger`, and the optional `osmo-mcp`) is encrypted by default. The UI intentionally stays on plain HTTP behind NetworkPolicy — Next.js does not natively serve TLS.
 
 **Default — encryption without validation.** Each upstream service mints its own ephemeral self-signed cert in-process at startup (ECDSA P-256, ~1ms) and loads it into uvicorn's SSLContext via `--ssl_self_signed true`. Envoy connects with TLS but does *not* validate the cert. The wire is encrypted; identity verification is delegated to NetworkPolicy + Kubernetes RBAC. No CA management, no Secrets, no rotation — cert lifecycle is tied to process lifecycle.
 
@@ -438,6 +489,7 @@ Traffic between the Envoy gateway and the upstream services (`osmo-service`, `os
 | `gateway.tls.upstreamCerts.router` | Same, for `osmo-router`. | `""` |
 | `gateway.tls.upstreamCerts.agent` | Same, for `osmo-agent`. | `""` |
 | `gateway.tls.upstreamCerts.logger` | Same, for `osmo-logger`. | `""` |
+| `gateway.tls.upstreamCerts.mcp` | Same, for the optional `osmo-mcp`. | `""` |
 | `gateway.tls.caSecret` | Existing Secret containing `ca.crt`. When set, Envoy validates upstreams against this CA; when empty, TLS is encryption-only. | `""` |
 
 NetworkPolicy and TLS are independent: NetworkPolicy controls *who* can connect at L3/L4; TLS encrypts the bytes at L7. Run them together for defense in depth.

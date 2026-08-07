@@ -288,7 +288,7 @@ Create ``osmo_values.yaml`` for the OSMO service with the following sample.
   :icon: file
 
   .. code-block:: yaml
-    :emphasize-lines: 4, 21-23, 34, 36, 42, 51, 54-59, 74, 148-149, 153-154, 160, 164, 178-180, 217-219
+    :emphasize-lines: 4, 21-23, 34, 36, 42, 51, 54-59, 74, 86, 153-154, 158-159, 165, 169, 183-185, 222-224
 
     # Global configuration shared across all OSMO services
     global:
@@ -483,10 +483,10 @@ Create ``osmo_values.yaml`` for the OSMO service with the following sample.
             cluster: osmo-service-jwks
 
       # Gateway -> upstream TLS. Enabled by default: each upstream service
-      # (osmo-service, osmo-router, osmo-agent, osmo-logger) mints an
-      # ephemeral self-signed cert in-process at startup, uvicorn serves
-      # HTTPS on :8000, and Envoy connects with TLS but skips cert validation.
-      # UI stays HTTP behind NetworkPolicy.
+      # (osmo-service, osmo-router, osmo-agent, osmo-logger, and optional
+      # osmo-mcp) mints an ephemeral self-signed cert in-process at startup,
+      # uvicorn serves HTTPS on :8000, and Envoy connects with TLS but skips
+      # cert validation. UI stays HTTP behind NetworkPolicy.
       #
       # To use externally-provisioned certs (cert-manager, Vault CSI,
       # sealed-secrets, manual — OSMO doesn't care), point upstreamCerts at
@@ -499,6 +499,7 @@ Create ``osmo_values.yaml`` for the OSMO service with the following sample.
         #   router:  osmo-router-tls
         #   agent:   osmo-agent-tls
         #   logger:  osmo-logger-tls
+        #   mcp:     osmo-mcp-tls
         # caSecret: osmo-gateway-ca
 
       # OAuth2 Proxy configuration
@@ -564,6 +565,12 @@ Add the UI configuration to ``osmo_values.yaml`` with the following sample value
 .. note::
    Refer to the `README <https://github.com/NVIDIA/OSMO/blob/main/deployments/charts/service/README.md>`_ page for detailed configuration options, including gateway configuration.
 
+.. seealso::
+
+   To enable the optional MCP feature, see :ref:`mcp_deployment` under
+   Advanced Configuration.
+
+.. _deploy_service_deploy_components:
 
 Step 5: Deploy Components
 =========================
@@ -636,6 +643,7 @@ Step 7: Post-deployment Configuration
 
 4. Verify access to the UI at https://osmo.example.com through your domain
 
+.. _deploy_service_troubleshooting:
 
 Troubleshooting
 ===============
