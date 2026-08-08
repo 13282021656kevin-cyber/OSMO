@@ -3,8 +3,8 @@
 You are generating tests for the OSMO codebase to improve code coverage.
 Read `AGENTS.md` at the repo root for project coding standards (import rules,
 naming conventions, type annotations, assertion style).
-Read `src/scripts/testbot/TESTBOT_RULES.md` for test quality rules, language
-conventions, and verification steps.
+Test quality rules, language conventions, and verification steps are appended
+below from `src/scripts/testbot/TESTBOT_RULES.md`.
 
 ## Primary Objective
 
