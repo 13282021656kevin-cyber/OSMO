@@ -148,6 +148,13 @@ jobs:
         if: matrix.chart == 'service'
         run: bash deployments/charts/service/ci/validate-mcp-chart.sh
 
+      - name: Chart-specific render tests
+        run: |
+          TEST_SCRIPT="deployments/charts/${{ matrix.chart }}/tests/render-tests.sh"
+          if [ -f "$TEST_SCRIPT" ]; then
+            bash "$TEST_SCRIPT"
+          fi
+
       - name: Validate unified OSMO chart
         if: matrix.chart == 'osmo'
         run: bash deployments/charts/osmo/tests/test_osmo_charts.sh osmo
