@@ -17,21 +17,21 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "osmo.v1.apiName" . }}-configs
+  name: {{ include "osmo.api.fullname" . }}-config
   labels:
-    app: {{ include "osmo.v1.apiName" . }}
-  {{- with .Values.configuration.extraAnnotations }}
+    {{- include "osmo.component.labels" (dict "root" . "component" "configuration") | nindent 4 }}
+  {{- with (include "osmo.metadata.annotations" (dict "root" . "annotations" .Values.configuration.extraAnnotations)) }}
   annotations:
-    {{- toYaml . | nindent 4 }}
+    {{- . | nindent 4 }}
   {{- end }}
 data:
   config.yaml: |
     {{- $cfg := .Values.configuration }}
-    {{- if or $cfg.service .Values.exposure.baseUrl }}
+    {{- if or $cfg.service .Values.externalUrl }}
     service:
       {{- $service := deepCopy ($cfg.service | default dict) }}
-      {{- if .Values.exposure.baseUrl }}
-      {{- $_ := set $service "service_base_url" .Values.exposure.baseUrl }}
+      {{- if .Values.externalUrl }}
+      {{- $_ := set $service "service_base_url" .Values.externalUrl }}
       {{- end }}
       {{- toYaml $service | nindent 6 }}
     {{- end }}

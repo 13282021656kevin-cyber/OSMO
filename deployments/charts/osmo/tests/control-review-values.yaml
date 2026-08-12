@@ -1,14 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+externalUrl: https://osmo.example.com
+
 configuration:
   service: null
 
+externalDependencies:
+  valkey:
+    tls:
+      enabled: false
+
+monitoring:
+  podMonitor:
+    enabled: true
+
 services:
-  api:
-    monitoring:
-      podMonitor:
-        enabled: true
+  api: {}
   ui:
     docsBaseUrl: "*docs"
     cliInstallScriptUrl: "&install"
@@ -45,15 +53,6 @@ gateway:
     ssl:
       enabled: true
       secretName: gateway-tls
-    ingress:
-      enabled: true
-      sslEnabled: true
-      albAnnotations:
-        enabled: true
-        groupName: osmo
-        groupOrder: "10"
-        # Synthetic test-only ARN used to verify ALB annotation rendering.
-        sslCertArn: arn:aws:acm:us-east-1:123456789012:certificate/test
   oauth2Proxy:
     enabled: true
     useKubernetesSecrets: true
@@ -63,7 +62,14 @@ gateway:
     enabled: true
   rateLimit:
     enabled: true
-    redis:
-      tlsEnabled: false
   networkPolicies:
     enabled: true
+
+ingress:
+  enabled: true
+  hostname: osmo.example.com
+  annotations:
+    alb.ingress.kubernetes.io/backend-protocol: HTTPS
+  tls:
+    enabled: true
+    secretName: osmo-ingress-tls

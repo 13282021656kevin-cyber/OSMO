@@ -14,13 +14,8 @@ embeddedDependencies:
     enabled: false
   objectStorage:
     enabled: false
-  gateway:
-    enabled: false
   kaiScheduler:
     enabled: false
-
-exposure:
-  mode: external
 
 configuration:
   enabled: true
@@ -33,14 +28,69 @@ services:
     enabled: false
   ui:
     enabled: true
+  worker:
+    autoscaling:
+      enabled: true
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+    podDisruptionBudget:
+      enabled: true
+      labels: {}
+      annotations: {}
+      maxUnavailable: 1
+      unhealthyPodEvictionPolicy: AlwaysAllow
   api:
-    monitoring:
-      podMonitor:
-        enabled: false
+    autoscaling:
+      enabled: true
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+    podDisruptionBudget:
+      enabled: true
+      labels: {}
+      annotations: {}
+      maxUnavailable: 1
+      unhealthyPodEvictionPolicy: AlwaysAllow
+  router:
+    autoscaling:
+      enabled: true
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+    podDisruptionBudget:
+      enabled: true
+      labels: {}
+      annotations: {}
+      maxUnavailable: 1
+      unhealthyPodEvictionPolicy: AlwaysAllow
+  logger:
+    autoscaling:
+      enabled: true
+    podDisruptionBudget:
+      enabled: true
+      labels: {}
+      annotations: {}
+      maxUnavailable: 1
+      unhealthyPodEvictionPolicy: AlwaysAllow
+  agent:
+    autoscaling:
+      enabled: true
 
 gateway:
   envoy:
     enabled: true
+    autoscaling:
+      enabled: true
+    podDisruptionBudget:
+      enabled: true
+      labels: {}
+      annotations: {}
+      maxUnavailable: 1
+      unhealthyPodEvictionPolicy: AlwaysAllow
     service:
       # Keep the unauthenticated in-cluster gateway behind an operator-managed,
       # authenticating edge rather than provisioning a public load balancer.
@@ -50,6 +100,10 @@ gateway:
   authz:
     enabled: false
   rateLimit:
+    enabled: false
+
+monitoring:
+  podMonitor:
     enabled: false
 
 secrets:

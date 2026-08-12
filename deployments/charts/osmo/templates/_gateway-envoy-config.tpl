@@ -25,23 +25,23 @@ Kubernetes rotates ConfigMap symlinks atomically.  The watched_directory
 setting detects this rotation and triggers Envoy to reload.
 */}}
 
-{{- define "osmo.v1.gateway-envoy-config" -}}
+{{- define "osmo.gateway.envoyConfig" -}}
 {{- $gw := .Values.gateway }}
 {{- $envoy := $gw.envoy }}
 {{- $mcp := .Values.services.mcp }}
-{{- $serviceHost := $gw.upstreams.service.host | default (include "osmo.v1.apiName" .) }}
-{{- $routerName := include "osmo.v1.componentName" (dict "root" . "suffix" "router") }}
+{{- $serviceHost := $gw.upstreams.api.host | default (include "osmo.api.fullname" .) }}
+{{- $routerName := include "osmo.component.fullname" (dict "root" . "suffix" "router") }}
 {{- $routerHost := $gw.upstreams.router.host | default (printf "%s-headless" $routerName) }}
-{{- $uiHost := $gw.upstreams.ui.host | default (include "osmo.v1.componentName" (dict "root" . "suffix" "ui")) }}
-{{- $agentHost := $gw.upstreams.agent.host | default (include "osmo.v1.componentName" (dict "root" . "suffix" "agent")) }}
-{{- $loggerName := include "osmo.v1.componentName" (dict "root" . "suffix" "logger") }}
+{{- $uiHost := $gw.upstreams.ui.host | default (include "osmo.component.fullname" (dict "root" . "suffix" "ui")) }}
+{{- $agentHost := $gw.upstreams.agent.host | default (include "osmo.component.fullname" (dict "root" . "suffix" "agent")) }}
+{{- $loggerName := include "osmo.component.fullname" (dict "root" . "suffix" "logger") }}
 {{- $loggerHost := $gw.upstreams.logger.host | default (printf "%s-headless" $loggerName) }}
 {{- $mcpEnabled := $mcp.enabled | default false }}
 {{- $mcpPath := "/mcp" }}
 {{- $mcpMetadataPath := "/.well-known/oauth-protected-resource/mcp" }}
 {{- $mcpResourceUrl := "" }}
 {{- $mcpMetadataUrl := "" }}
-{{- $mcpServiceName := include "osmo.v1.componentName" (dict "root" . "suffix" "mcp") }}
+{{- $mcpServiceName := include "osmo.component.fullname" (dict "root" . "suffix" "mcp") }}
 {{- $skipAuthPaths := concat (default (list) $envoy.skipAuthPaths) (default (list) $envoy.extraSkipAuthPaths) }}
 {{- $authnSkipPaths := $skipAuthPaths }}
 {{- if $gw.oauth2Proxy.enabled }}
@@ -57,7 +57,7 @@ setting detects this rotation and triggers Envoy to reload.
 {{- if not $envoy.jwt.providers }}
 {{- fail "services.mcp.enabled requires at least one gateway.envoy.jwt.providers entry" }}
 {{- end }}
-{{- $mcpResourceUrl = include "osmo.v1.mcp-resource-url" . }}
+{{- $mcpResourceUrl = include "osmo.mcp.resourceUrl" . }}
 {{- if not (kindIs "slice" $mcp.authorizationServers) }}
 {{- fail "services.mcp.authorizationServers must be a list" }}
 {{- end }}
@@ -78,7 +78,7 @@ setting detects this rotation and triggers Envoy to reload.
 {{- fail "services.mcp.scopes entries must not be empty" }}
 {{- end }}
 {{- end }}
-{{- $_ := required "services.mcp.image.name is required when MCP is enabled" $mcp.image.name }}
+{{- $_ := required "services.mcp.image.repository is required when MCP is enabled" $mcp.image.repository }}
 {{- if or (lt (int $mcp.port) 1) (gt (int $mcp.port) 65535) }}
 {{- fail "services.mcp.port must be between 1 and 65535" }}
 {{- end }}
@@ -100,13 +100,19 @@ setting detects this rotation and triggers Envoy to reload.
 {{- $mcpBaseUrl := trimSuffix $mcpPath $mcpResourceUrl }}
 {{- $mcpMetadataUrl = printf "%s%s" $mcpBaseUrl $mcpMetadataPath }}
 {{- end }}
-{{- $gwName := include "osmo.v1.gateway-name" . }}
+{{- $gwName := include "osmo.gateway.fullname" . }}
 {{- if $envoy.enabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ $gwName }}-envoy-config
   namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osmo.component.labels" (dict "root" . "component" "configuration") | nindent 4 }}
+  {{- with (include "osmo.metadata.annotations" (dict "root" .)) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 data:
   bootstrap.yaml: |
     admin:
@@ -265,8 +271,8 @@ data:
                 - match:
                     path: /signout
                   redirect:
-                    {{- if .Values.services.api.auth.logout_endpoint }}
-                    path_redirect: "/oauth2/sign_out?rd={{ .Values.services.api.auth.logout_endpoint | urlquery }}"
+                    {{- if .Values.services.api.auth.logoutEndpoint }}
+                    path_redirect: "/oauth2/sign_out?rd={{ .Values.services.api.auth.logoutEndpoint | urlquery }}"
                     {{- else }}
                     path_redirect: "/oauth2/sign_out"
                     {{- end }}
@@ -388,18 +394,18 @@ data:
                     safe_regex:
                       regex: "^/api/workflow/.+/(logs|events|error_logs)$"
                   route:
-                    cluster: osmo-service
+                    cluster: osmo-api
                     timeout: 0s
                     idle_timeout: 60s
                 - match:
                     prefix: /api/
                   route:
-                    cluster: osmo-service
+                    cluster: osmo-api
                     timeout: 60s
                 - match:
                     prefix: /client/
                   route:
-                    cluster: osmo-service
+                    cluster: osmo-api
                     timeout: 60s
                 {{- end }}
 
@@ -739,7 +745,7 @@ data:
                           max_interval: 3s
                     claim_to_headers:
                     - claim_name: {{$provider.user_claim}}
-                      header_name: {{$envoy.jwt.user_header}}
+                      header_name: {{$envoy.jwt.userHeader}}
                   {{- end }}
                 rules:
                   {{- if $skipAuthPaths }}
@@ -855,7 +861,7 @@ data:
   cds.yaml: |
     resources:
     - "@type": type.googleapis.com/envoy.config.cluster.v3.Cluster
-      name: osmo-service
+      name: osmo-api
       connect_timeout: 3s
       type: STRICT_DNS
       dns_lookup_family: V4_ONLY
@@ -867,14 +873,14 @@ data:
           max_requests: {{ $envoy.maxRequests }}
       {{- end }}
       load_assignment:
-        cluster_name: osmo-service
+        cluster_name: osmo-api
         endpoints:
         - lb_endpoints:
           - endpoint:
               address:
                 socket_address:
                   address: {{ $serviceHost }}
-                  port_value: {{ $gw.upstreams.service.port }}
+                  port_value: {{ $gw.upstreams.api.port }}
       {{- if $gw.tls.enabled }}
       transport_socket:
         name: envoy.transport_sockets.tls
@@ -1196,7 +1202,7 @@ data:
               address:
                 socket_address:
                   address: {{ $jwksHost }}
-                  port_value: {{ $envoy.internalJwks.port | default $gw.upstreams.service.port }}
+                  port_value: {{ $envoy.internalJwks.port | default $gw.upstreams.api.port }}
       {{- if $gw.tls.enabled }}
       transport_socket:
         name: envoy.transport_sockets.tls

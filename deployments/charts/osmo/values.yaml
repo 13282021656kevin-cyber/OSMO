@@ -23,8 +23,6 @@ embeddedDependencies:
     enabled: false
   objectStorage:
     enabled: false
-  gateway:
-    enabled: false
   kaiScheduler:
     enabled: false
 
@@ -65,19 +63,21 @@ externalDependencies:
       apps: ''
 
 # Override the names Helm derives from the chart and release. Leave empty for
-# conventional names such as `osmo-service` and `osmo-gateway`.
+# conventional names such as `osmo-api` and `osmo-gateway`.
 nameOverride: ''
 fullnameOverride: ''
 
-# Shared defaults for OSMO-owned images. A service can override these values in
-# its own `image` block; an empty service tag inherits `image.tag`, which in
-# turn defaults to Chart.appVersion.
-image:
+# Global image registry and pull credentials. A non-empty registry overrides
+# every component and runtime image registry for air-gapped mirrors.
+global:
+  imageRegistry: ''
+  imagePullSecrets: []
+
+# Runtime images referenced by submitted workflows.
+runtimeImage:
   registry: nvcr.io
-  repositoryPrefix: nvidia/osmo
+  repository: nvidia/osmo
   tag: ''
-  pullPolicy: IfNotPresent
-imagePullSecrets: []
 
 # Metadata and scheduling defaults shared by OSMO-owned workloads. Labels,
 # annotations, and node selectors merge with service-specific pod values;
@@ -89,9 +89,10 @@ podDefaults:
   annotations: {}
   nodeSelector: {}
   tolerations: []
-  # TODO: Apply these shared pod-policy fields to every OSMO workload.
   affinity: {}
-  podSecurityContext: {}
+  podSecurityContext:
+    seccompProfile:
+      type: RuntimeDefault
   containerSecurityContext:
     allowPrivilegeEscalation: false
     capabilities:
@@ -99,6 +100,7 @@ podDefaults:
       - ALL
     runAsNonRoot: true
     runAsUser: 1001
+  terminationGracePeriodSeconds: 30
 
 # Shared Python service logging settings.
 logging:
@@ -107,19 +109,55 @@ logging:
   k8sLogLevel: WARNING
   logFormat: text
 
-# Describe how clients reach the release.
-#
-# Supported mode values are `external`, `gateway`, and `ingress`. Only
-# `external` is implemented today: the chart creates the internal
-# `osmo-gateway` Service but expects an operator-managed proxy, load balancer,
-# or port-forward to expose it.
-# TODO: Implement Kubernetes edge resources for `gateway` and `ingress` modes;
-# those modes currently fail validation.
-exposure:
-  mode: external
-  # Public OSMO URL used in generated service configuration. Include the
-  # scheme, for example `https://osmo.example.com`.
-  baseUrl: ''
+# Public OSMO URL used in generated service configuration and redirects.
+# Include the scheme, for example `https://osmo.example.com`.
+externalUrl: ''
+
+# Optional Kubernetes Ingress for the OSMO gateway Service.
+ingress:
+  enabled: false
+  labels: {}
+  annotations: {}
+  ingressClassName: ''
+  hostname: ''
+  path: /
+  pathType: Prefix
+  tls:
+    enabled: false
+    secretName: ''
+  extraHosts: []
+  extraPaths: []
+  extraRules: []
+  extraTls: []
+
+# Optional Gateway API HTTPRoute. Parent references must target a Gateway
+# managed outside this chart.
+httproute:
+  enabled: false
+  labels: {}
+  annotations: {}
+  parentRefs: []
+  hostnames: []
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+
+# Optional Prometheus Operator PodMonitors for OSMO metrics endpoints.
+monitoring:
+  podMonitor:
+    enabled: false
+    labels: {}
+    annotations: {}
+    interval: 30s
+    scrapeTimeout: 10s
+    scheme: http
+    tlsConfig: {}
+    honorLabels: false
+    podTargetLabels: []
+    relabelings: []
+    metricRelabelings: []
 
 # References to operator-owned Kubernetes Secrets. Inline credentials are not
 # accepted.
@@ -170,9 +208,11 @@ services:
     enabled: false
     replicas: 1
     image:
-      name: mcp-self-hosted
+      registry: nvcr.io
+      repository: nvidia/osmo/mcp-self-hosted
       tag: ''
-      pullPolicy: Always
+      digest: ''
+      pullPolicy: IfNotPresent
     port: 8000
     resourceUrl: ''
     requestTimeoutSeconds: 10
@@ -183,6 +223,12 @@ services:
       name: ''
       create: false
       annotations: {}
+      automountServiceAccountToken: false
+    podDisruptionBudget:
+      enabled: false
+      labels: {}
+      annotations: {}
+      unhealthyPodEvictionPolicy: IfHealthyBudget
     resources:
       requests:
         cpu: 100m
@@ -231,18 +277,26 @@ services:
     enabled: true
     replicas: 1
     image:
-      name: web-ui
+      registry: nvcr.io
+      repository: nvidia/osmo/web-ui
       tag: ''
-      pullPolicy: Always
-    # Leave empty to use this release's gateway Service and port 80.
+      digest: ''
+      pullPolicy: IfNotPresent
+    # Leave empty to use this release's gateway Service and configured port.
     apiHostname: ''
     portForwardEnabled: false
     nextjsSslEnabled: false
     containerPort: 8000
     serviceAccount:
-      name: osmo
+      name: ''
       create: false
       annotations: {}
+      automountServiceAccountToken: false
+    podDisruptionBudget:
+      enabled: false
+      labels: {}
+      annotations: {}
+      unhealthyPodEvictionPolicy: IfHealthyBudget
     maxHttpHeaderSizeKb: 128
     command: []
     args: []
@@ -252,8 +306,10 @@ services:
       enabled: false
       minReplicas: 1
       maxReplicas: 3
-      hpaTarget: 85
+      hpaCpuTarget: 85
+      hpaMemoryTarget: null
       customMetrics: []
+      behavior: {}
     service:
       type: ''
       port: 80
@@ -262,7 +318,6 @@ services:
       labels: {}
       annotations: {}
       extraPorts: []
-      selector: {}
     resources: {}
     extraPorts: []
     envFrom: []
@@ -289,10 +344,14 @@ services:
       timeoutSeconds: 3
       periodSeconds: 5
     env: []
+    extraVolumeMounts: []
     pod:
       labels: {}
       annotations: {}
       nodeSelector: {}
+      containerSecurityContext:
+        readOnlyRootFilesystem: true
+        runAsUser: 1000
       topologySpreadConstraints:
       - topologyKey: kubernetes.io/hostname
         maxSkew: 1
@@ -302,15 +361,18 @@ services:
         whenUnsatisfiable: ScheduleAnyway
       hostAliases: []
       initContainers: []
+      extraVolumes: []
 
   # Promotes scheduled Redis jobs when their delay expires.
   delayedJobMonitor:
     enabled: true
     replicas: 1
     image:
-      name: delayed-job-monitor
+      registry: nvcr.io
+      repository: nvidia/osmo/delayed-job-monitor
       tag: ''
-      pullPolicy: Always
+      digest: ''
+      pullPolicy: IfNotPresent
     startupProbe:
       exec:
         command:
@@ -327,32 +389,40 @@ services:
       name: ''
       create: false
       annotations: {}
-    volumeMounts:
-    - name: progress-files
-      mountPath: /var/run/osmo
+      automountServiceAccountToken: false
+    podDisruptionBudget:
+      enabled: false
+      labels: {}
+      annotations: {}
+      unhealthyPodEvictionPolicy: IfHealthyBudget
+    extraVolumeMounts: []
     env: []
     pod:
       labels: {}
       annotations: {}
       nodeSelector: {}
+      containerSecurityContext:
+        readOnlyRootFilesystem: true
       initContainers: []
-      volumes:
-      - name: progress-files
-        emptyDir: {}
+      extraVolumes: []
 
   # Executes asynchronous control-plane jobs from the Valkey queue.
   worker:
     enabled: true
     autoscaling:
+      enabled: false
       minReplicas: 2
       maxReplicas: 10
       hpaMemoryTarget: 80
       hpaCpuTarget: 80
       customMetrics: []
+      behavior: {}
     image:
-      name: worker
+      registry: nvcr.io
+      repository: nvidia/osmo/worker
       tag: ''
-      pullPolicy: Always
+      digest: ''
+      pullPolicy: IfNotPresent
     startupProbe:
       exec:
         command:
@@ -369,12 +439,21 @@ services:
       name: ''
       create: false
       annotations: {}
+      automountServiceAccountToken: false
+    podDisruptionBudget:
+      enabled: false
+      labels: {}
+      annotations: {}
+      unhealthyPodEvictionPolicy: IfHealthyBudget
     env: []
     replicas: 2
+    extraVolumeMounts: []
     pod:
       labels: {}
       annotations: {}
       nodeSelector: {}
+      containerSecurityContext:
+        readOnlyRootFilesystem: true
       topologySpreadConstraints:
       - topologyKey: kubernetes.io/hostname
         maxSkew: 1
@@ -383,38 +462,36 @@ services:
         maxSkew: 1
         whenUnsatisfiable: ScheduleAnyway
       initContainers: []
+      extraVolumes: []
 
   # Main OSMO REST API and control-plane service.
   api:
     enabled: true
-    monitoring:
-      podMonitor:
-        enabled: false
-        interval: 30s
-        scrapeTimeout: 10s
-        scheme: http
-        tlsConfig: {}
     autoscaling:
+      enabled: false
       minReplicas: 3
       maxReplicas: 9
       hpaMemoryTarget: 80
       hpaCpuTarget: 80
       customMetrics: []
+      behavior: {}
     image:
-      name: service
+      registry: nvcr.io
+      repository: nvidia/osmo/service
       tag: ''
-      pullPolicy: Always
+      digest: ''
+      pullPolicy: IfNotPresent
     hostname: ''
     clientInstallUrl: https://raw.githubusercontent.com/NVIDIA/OSMO/refs/heads/main/install.sh
     disableTaskMetrics: false
     auth:
       enabled: false
-      device_endpoint: ''
-      device_client_id: ''
-      browser_endpoint: ''
-      browser_client_id: ''
-      token_endpoint: ''
-      logout_endpoint: ''
+      deviceEndpoint: ''
+      deviceClientId: ''
+      browserEndpoint: ''
+      browserClientId: ''
+      tokenEndpoint: ''
+      logoutEndpoint: ''
     livenessProbe:
       httpGet:
         port: 8000
@@ -445,32 +522,46 @@ services:
       name: ''
       create: true
       annotations: {}
+      automountServiceAccountToken: true
+    podDisruptionBudget:
+      enabled: false
+      labels: {}
+      annotations: {}
+      unhealthyPodEvictionPolicy: IfHealthyBudget
     env: []
     replicas: 3
+    extraVolumeMounts: []
     pod:
       labels: {}
       annotations: {}
       nodeSelector: {}
+      containerSecurityContext:
+        readOnlyRootFilesystem: true
       topologySpreadConstraints:
       - topologyKey: topology.kubernetes.io/zone
         maxSkew: 1
         whenUnsatisfiable: ScheduleAnyway
       hostAliases: []
       initContainers: []
+      extraVolumes: []
 
   # Routes sticky HTTP and WebSocket sessions to connected backends.
   router:
     enabled: true
     autoscaling:
+      enabled: false
       minReplicas: 3
       maxReplicas: 5
-      memoryTarget: 80
+      hpaMemoryTarget: 80
       hpaCpuTarget: 80
       customMetrics: []
+      behavior: {}
     image:
-      name: router
+      registry: nvcr.io
+      repository: nvidia/osmo/router
       tag: ''
-      pullPolicy: Always
+      digest: ''
+      pullPolicy: IfNotPresent
     hostname: ''
     webserverEnabled: false
     extraArgs: []
@@ -478,6 +569,12 @@ services:
       name: ''
       create: false
       annotations: {}
+      automountServiceAccountToken: false
+    podDisruptionBudget:
+      enabled: false
+      labels: {}
+      annotations: {}
+      unhealthyPodEvictionPolicy: IfHealthyBudget
     extraPorts: []
     resources: {}
     livenessProbe:
@@ -504,30 +601,38 @@ services:
       timeoutSeconds: 30
     env: []
     replicas: 3
+    extraVolumeMounts: []
     pod:
       labels: {}
       annotations: {}
       nodeSelector: {}
+      containerSecurityContext:
+        readOnlyRootFilesystem: true
       topologySpreadConstraints:
       - topologyKey: topology.kubernetes.io/zone
         maxSkew: 1
         whenUnsatisfiable: ScheduleAnyway
       hostAliases: []
       initContainers: []
+      extraVolumes: []
 
   # Receives workflow logs and task metrics from runtime containers.
   logger:
     enabled: true
     autoscaling:
+      enabled: false
       minReplicas: 3
       maxReplicas: 9
       hpaMemoryTarget: 80
       hpaCpuTarget: 80
       customMetrics: []
+      behavior: {}
     image:
-      name: logger
+      registry: nvcr.io
+      repository: nvidia/osmo/logger
       tag: ''
-      pullPolicy: Always
+      digest: ''
+      pullPolicy: IfNotPresent
     startupProbe:
       exec:
         command:
@@ -551,32 +656,46 @@ services:
       name: ''
       create: false
       annotations: {}
+      automountServiceAccountToken: false
+    podDisruptionBudget:
+      enabled: false
+      labels: {}
+      annotations: {}
+      unhealthyPodEvictionPolicy: IfHealthyBudget
     envoy: {}
     env: []
     replicas: 3
+    extraVolumeMounts: []
     pod:
       labels: {}
       annotations: {}
       nodeSelector: {}
+      containerSecurityContext:
+        readOnlyRootFilesystem: true
       topologySpreadConstraints:
       - topologyKey: topology.kubernetes.io/zone
         maxSkew: 1
         whenUnsatisfiable: ScheduleAnyway
       initContainers: []
+      extraVolumes: []
 
   # Receives backend-cluster events and heartbeat streams.
   agent:
     enabled: true
     autoscaling:
+      enabled: false
       minReplicas: 1
       maxReplicas: 9
       hpaMemoryTarget: 80
       hpaCpuTarget: 80
       customMetrics: []
+      behavior: {}
     image:
-      name: agent
+      registry: nvcr.io
+      repository: nvidia/osmo/agent
       tag: ''
-      pullPolicy: Always
+      digest: ''
+      pullPolicy: IfNotPresent
     startupProbe:
       exec:
         command:
@@ -607,34 +726,49 @@ services:
       name: ''
       create: false
       annotations: {}
+      automountServiceAccountToken: false
+    podDisruptionBudget:
+      enabled: false
+      labels: {}
+      annotations: {}
+      unhealthyPodEvictionPolicy: IfHealthyBudget
     envoy: {}
     env: []
     replicas: 1
+    extraVolumeMounts: []
     pod:
       labels: {}
       annotations: {}
       nodeSelector: {}
+      containerSecurityContext:
+        readOnlyRootFilesystem: true
       topologySpreadConstraints:
       - topologyKey: topology.kubernetes.io/zone
         maxSkew: 1
         whenUnsatisfiable: ScheduleAnyway
       initContainers: []
+      extraVolumes: []
 
 # Internal API gateway and optional gateway-adjacent services. This block is
-# independent of `exposure.mode`: `gateway.envoy` routes traffic inside the
-# release even when an external edge owns the public URL.
+# independent of the Kubernetes edge mechanism: `gateway.envoy` routes traffic
+# inside the release even when an external edge owns the public URL.
 gateway:
   # Envoy proxy that provides the single in-cluster OSMO entry point.
   envoy:
     enabled: true
     autoscaling:
+      enabled: false
       minReplicas: 2
       maxReplicas: 6
       hpaCpuTarget: 80
       hpaMemoryTarget: 80
       customMetrics: []
+      behavior: {}
     image:
-      repository: envoyproxy/envoy:v1.38.1
+      registry: docker.io
+      repository: envoyproxy/envoy
+      tag: v1.38.1
+      digest: ''
       pullPolicy: IfNotPresent
     logLevel: info
     listenerPort: 8080
@@ -645,28 +779,25 @@ gateway:
       name: ''
       create: false
       annotations: {}
+      automountServiceAccountToken: false
+    podDisruptionBudget:
+      enabled: false
+      labels: {}
+      annotations: {}
+      unhealthyPodEvictionPolicy: IfHealthyBudget
     defaultIdentity:
       user: ''
       roles: ''
       allowedPools: ''
     service:
-      type: LoadBalancer
-      httpsPort: 443
+      type: ClusterIP
+      port: 80
       nodePort: null
+      labels: {}
       annotations: {}
-    # TODO: Remove this legacy enabled switch and derive Ingress rendering from
-    # top-level exposure.mode when ingress exposure is implemented.
-    ingress:
-      enabled: false
-      ingressClass: alb
-      albAnnotations:
-        enabled: false
-        groupName: osmo
-        groupOrder: '10'
-        sslCertArn: ''
-      sslEnabled: false
-      sslSecret: osmo-tls
-      annotations: {}
+      loadBalancerClass: ''
+      loadBalancerSourceRanges: []
+      externalTrafficPolicy: Cluster
     ssl:
       enabled: false
       secretName: envoy-ssl-cert
@@ -701,11 +832,11 @@ gateway:
       host: ''
     internalJwks:
       enabled: true
-      cluster: osmo-service-jwks
+      cluster: osmo-api-jwks
       host: ''
       port: ''
     jwt:
-      user_header: x-osmo-user
+      userHeader: x-osmo-user
       providers: []
     skipAuthPaths:
     - /api/version
@@ -727,7 +858,7 @@ gateway:
     extraRoutes: []
     extraClusters: []
     maxRequests: 100
-    volumeMounts: []
+    extraVolumeMounts: []
     replicas: 2
     pod:
       nodeSelector: {}
@@ -736,17 +867,17 @@ gateway:
         capabilities:
           drop:
           - ALL
+        readOnlyRootFilesystem: true
         runAsNonRoot: true
         runAsUser: 1001
-      volumes: []
+      extraVolumes: []
       labels: {}
       annotations: {}
 
   # Internal destinations used by Envoy routes. Empty hosts resolve to this
   # release's Services; set a host only to route outside the release.
   upstreams:
-    service:
-      enabled: true
+    api:
       host: ''
       port: 80
     router:
@@ -771,13 +902,18 @@ gateway:
   oauth2Proxy:
     enabled: true
     autoscaling:
+      enabled: false
       minReplicas: 1
       maxReplicas: 3
       hpaCpuTarget: 80
       hpaMemoryTarget: 80
       customMetrics: []
+      behavior: {}
     image:
-      repository: quay.io/oauth2-proxy/oauth2-proxy:v7.14.2
+      registry: quay.io
+      repository: oauth2-proxy/oauth2-proxy
+      tag: v7.14.2
+      digest: ''
       pullPolicy: IfNotPresent
     httpPort: 4180
     metricsPort: 44180
@@ -800,10 +936,6 @@ gateway:
       clientSecret: /etc/oauth2-proxy/client-secret
       cookieSecret: /etc/oauth2-proxy/cookie-secret
     extraArgs: []
-    redis:
-      port: 6379
-      tlsEnabled: true
-      dbNumber: 0
     resources:
       requests:
         cpu: 50m
@@ -814,7 +946,13 @@ gateway:
       name: ''
       create: false
       annotations: {}
-    volumeMounts: []
+      automountServiceAccountToken: false
+    podDisruptionBudget:
+      enabled: false
+      labels: {}
+      annotations: {}
+      unhealthyPodEvictionPolicy: IfHealthyBudget
+    extraVolumeMounts: []
     env: []
     replicas: 1
     pod:
@@ -827,22 +965,26 @@ gateway:
           - ALL
         runAsNonRoot: true
         runAsUser: 1001
-      volumes: []
+      extraVolumes: []
       labels: {}
 
   # Optional external-authorization service backed by OSMO role policies.
   authz:
     enabled: true
     autoscaling:
+      enabled: false
       minReplicas: 1
       maxReplicas: 3
       hpaCpuTarget: 80
       hpaMemoryTarget: 80
       customMetrics: []
+      behavior: {}
     image:
-      name: authz-sidecar
+      registry: nvcr.io
+      repository: nvidia/osmo/authz-sidecar
       tag: ''
-      pullPolicy: Always
+      digest: ''
+      pullPolicy: IfNotPresent
     grpcPort: 50052
     postgres:
       maxConns: 10
@@ -876,7 +1018,13 @@ gateway:
       name: ''
       create: false
       annotations: {}
-    volumeMounts: []
+      automountServiceAccountToken: false
+    podDisruptionBudget:
+      enabled: false
+      labels: {}
+      annotations: {}
+      unhealthyPodEvictionPolicy: IfHealthyBudget
+    extraVolumeMounts: []
     env: []
     replicas: 1
     pod:
@@ -889,7 +1037,7 @@ gateway:
           - ALL
         runAsNonRoot: true
         runAsUser: 10001
-      volumes: []
+      extraVolumes: []
       labels: {}
 
   # Optional Envoy-compatible global rate-limit service backed by Valkey.
@@ -897,13 +1045,13 @@ gateway:
     enabled: false
     replicas: 1
     image:
-      repository: envoyproxy/ratelimit:875d418c
+      registry: docker.io
+      repository: envoyproxy/ratelimit
+      tag: 875d418c
+      digest: ''
       pullPolicy: IfNotPresent
     grpcPort: 8091
     httpPort: 8090
-    redis:
-      port: 6379
-      tlsEnabled: true
     config:
       domain: ratelimit
       descriptors: []
@@ -917,7 +1065,13 @@ gateway:
       name: ''
       create: false
       annotations: {}
-    volumeMounts: []
+      automountServiceAccountToken: false
+    podDisruptionBudget:
+      enabled: false
+      labels: {}
+      annotations: {}
+      unhealthyPodEvictionPolicy: IfHealthyBudget
+    extraVolumeMounts: []
     env: []
     pod:
       annotations: {}
@@ -929,7 +1083,7 @@ gateway:
           - ALL
         runAsNonRoot: true
         runAsUser: 1001
-      volumes: []
+      extraVolumes: []
       labels: {}
 
   # Optional ingress policies limiting gateway traffic to known upstream pods.
@@ -938,8 +1092,8 @@ gateway:
     # Release-relative component suffixes prevent policies from selecting pods
     # owned by another OSMO release in the same namespace.
     upstreams:
-    - name: service
-      component: service
+    - name: api
+      component: api
       port: 8000
     - name: router
       component: router
@@ -954,7 +1108,7 @@ gateway:
   tls:
     enabled: true
     upstreamCerts:
-      service: ''
+      api: ''
       router: ''
       agent: ''
       logger: ''

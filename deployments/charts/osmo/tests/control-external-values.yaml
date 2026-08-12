@@ -1,9 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-exposure:
-  mode: external
-  baseUrl: http://osmo-gateway
+externalUrl: http://osmo-gateway
 
 externalDependencies:
   postgresql:
@@ -36,6 +34,6 @@ secrets:
 services:
   api:
     image:
-      name: service
+      repository: nvidia/osmo/service
   mcp:
     enabled: false
