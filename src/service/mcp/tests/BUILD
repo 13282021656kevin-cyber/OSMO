@@ -19,6 +19,19 @@ SPDX-License-Identifier: Apache-2.0
 load("//bzl:py.bzl", "osmo_py_library", "osmo_py_test")
 load("@osmo_python_deps//:requirements.bzl", "requirement")
 
+osmo_py_test(
+    name = "test_auth",
+    srcs = ["test_auth.py"],
+    deps = [
+        "//src/service/mcp:fastmcp_runtime",
+        requirement("httpx"),
+        requirement("py-key-value-aio"),
+        requirement("pydantic"),
+        "//src/service/mcp:auth",
+        "//src/service/mcp:mcp_service_lib",
+    ],
+)
+
 osmo_py_library(
     name = "protocol_harness",
     srcs = ["protocol_harness.py"],
@@ -27,6 +40,7 @@ osmo_py_library(
         requirement("starlette"),
         "//src/lib/utils:login",
         "//src/service/mcp:gateway",
+        "//src/service/mcp:mcp_service_lib",
         "//src/service/mcp:protocol",
         "//src/service/mcp:request_context",
         "//src/service/mcp:tool_registry",
@@ -113,6 +127,7 @@ osmo_py_test(
     name = "test_credential_actions",
     srcs = ["test_credential_actions.py"],
     deps = [
+        "//src/service/mcp:fastmcp_runtime",
         requirement("httpx"),
         requirement("mcp"),
         ":protocol_harness",
@@ -135,6 +150,7 @@ osmo_py_test(
     name = "test_pools",
     srcs = ["test_pools.py"],
     deps = [
+        "//src/service/mcp:fastmcp_runtime",
         requirement("httpx"),
         requirement("mcp"),
         ":protocol_harness",
@@ -148,6 +164,7 @@ osmo_py_test(
     name = "test_protocol",
     srcs = ["test_protocol.py"],
     deps = [
+        "//src/service/mcp:fastmcp_runtime",
         requirement("httpx"),
         requirement("mcp"),
         requirement("pydantic"),
@@ -172,6 +189,7 @@ osmo_py_test(
     name = "test_resources",
     srcs = ["test_resources.py"],
     deps = [
+        "//src/service/mcp:fastmcp_runtime",
         requirement("httpx"),
         requirement("mcp"),
         ":protocol_harness",
@@ -186,6 +204,7 @@ osmo_py_test(
     name = "test_request_context",
     srcs = ["test_request_context.py"],
     deps = [
+        "//src/service/mcp:fastmcp_runtime",
         requirement("starlette"),
         "//src/service/mcp:request_context",
     ],
@@ -195,6 +214,7 @@ osmo_py_test(
     name = "test_server",
     srcs = ["test_server.py"],
     deps = [
+        "//src/service/mcp:fastmcp_runtime",
         requirement("httpx"),
         requirement("mcp"),
         requirement("pydantic"),
@@ -212,6 +232,7 @@ osmo_py_test(
     name = "test_tool_support",
     srcs = ["test_tool_support.py"],
     deps = [
+        "//src/service/mcp:fastmcp_runtime",
         requirement("mcp"),
         "//src/lib/utils:osmo_errors",
         "//src/service/mcp:gateway",
@@ -235,6 +256,7 @@ osmo_py_test(
     name = "test_workflows",
     srcs = ["test_workflows.py"],
     deps = [
+        "//src/service/mcp:fastmcp_runtime",
         requirement("httpx"),
         requirement("mcp"),
         ":protocol_harness",
@@ -247,6 +269,7 @@ osmo_py_test(
     name = "test_workflow_actions",
     srcs = ["test_workflow_actions.py"],
     deps = [
+        "//src/service/mcp:fastmcp_runtime",
         requirement("httpx"),
         requirement("mcp"),
         ":protocol_harness",

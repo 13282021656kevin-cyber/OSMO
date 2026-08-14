@@ -24,6 +24,8 @@ import contextvars
 import dataclasses
 import re
 
+from fastmcp.server.auth import AccessToken
+from fastmcp.server.dependencies import get_access_token, get_http_request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -125,12 +127,17 @@ class RequestContextMiddleware:
 
 
 def get_request_credentials() -> RequestCredentials:
-    """Return credentials for the active MCP request."""
+    """Return credentials from the active request's configured trust boundary."""
+    access_token = get_access_token()
+    if access_token is not None:
+        return _credentials_from_access_token(access_token)
+
     request_state = _request_state.get()
-    if request_state is None or request_state.credentials is None:
-        raise RequestContextUnavailable(
-            'MCP request credentials are unavailable.')
-    return request_state.credentials
+    if request_state is not None and request_state.credentials is not None:
+        return request_state.credentials
+
+    raise RequestContextUnavailable(
+        'MCP request credentials are unavailable.')
 
 
 def get_active_tool_name() -> str | None:
@@ -153,9 +160,12 @@ def track_request_task() -> Iterator[RequestCredentials]:
     """Cancel the current tool task when its owning MCP request ends."""
     request_state = _request_state.get()
     current_task = asyncio.current_task()
+    if request_state is None:
+        # FastMCP owns request-task cancellation in the integrated auth mode.
+        yield get_request_credentials()
+        return
     if (
-        request_state is None
-        or request_state.credentials is None
+        request_state.credentials is None
         or current_task is None
     ):
         raise RequestContextUnavailable(
@@ -167,6 +177,52 @@ def track_request_task() -> Iterator[RequestCredentials]:
         yield credentials
     finally:
         request_state.active_tasks.discard(current_task)
+
+
+def _credentials_from_access_token(
+    access_token: AccessToken,
+) -> RequestCredentials:
+    """Relay the verified upstream token returned by FastMCP's OIDC proxy."""
+    claims = access_token.claims or {}
+    upstream_claims = claims.get('upstream_claims')
+    if isinstance(upstream_claims, dict):
+        claims = upstream_claims
+
+    user_name = next((
+        value
+        for name in ('preferred_username', 'unique_name', 'upn', 'email', 'sub')
+        if isinstance((value := claims.get(name)), str)
+        and _is_valid_user_name(value)
+    ), None)
+    authorization_header = f'Bearer {access_token.token}'
+    if user_name is None or not _is_supported_authorization_header(
+        authorization_header
+    ):
+        raise RequestContextUnavailable(
+            'MCP request credentials are unavailable.')
+
+    request_id = None
+    try:
+        raw_request_ids = [
+            value
+            for name, value in get_http_request().scope.get('headers', [])
+            if name.lower() == _REQUEST_ID_HEADER
+        ]
+    except RuntimeError:
+        raw_request_ids = []
+    request_id_is_valid, request_id = _parse_request_id(
+        raw_request_ids,
+        authorization_header,
+    )
+    if not request_id_is_valid:
+        raise RequestContextUnavailable(
+            'MCP request credentials are unavailable.')
+
+    return RequestCredentials(
+        authorization_header=authorization_header,
+        user_name=user_name,
+        request_id=request_id,
+    )
 
 
 def request_id_overlaps_bearer(
@@ -210,13 +266,8 @@ def _parse_credentials(
     if (
         len(authorization_values) != 1
         or len(user_values) != 1
-        or len(request_id_values) > 1
         or len(authorization_values[0]) > MAX_AUTHORIZATION_HEADER_BYTES
         or len(user_values[0]) > MAX_USER_HEADER_BYTES
-        or (
-            request_id_values
-            and len(request_id_values[0]) > MAX_REQUEST_ID_HEADER_BYTES
-        )
     ):
         return None
 
@@ -230,24 +281,43 @@ def _parse_credentials(
     ):
         return None
 
-    request_id: str | None = None
-    if request_id_values:
-        request_id = _decode_ascii(request_id_values[0])
-        if (
-            request_id is None
-            or _REQUEST_ID.fullmatch(request_id) is None
-            or request_id_overlaps_bearer(
-                authorization_header,
-                request_id,
-            )
-        ):
-            return None
+    request_id_is_valid, request_id = _parse_request_id(
+        request_id_values,
+        authorization_header,
+    )
+    if not request_id_is_valid:
+        return None
 
     return RequestCredentials(
         authorization_header=authorization_header,
         user_name=user_name,
         request_id=request_id,
     )
+
+
+def _parse_request_id(
+    raw_values: list[bytes],
+    authorization_header: str,
+) -> tuple[bool, str | None]:
+    if (
+        len(raw_values) > 1
+        or (
+            raw_values
+            and len(raw_values[0]) > MAX_REQUEST_ID_HEADER_BYTES
+        )
+    ):
+        return False, None
+    if not raw_values:
+        return True, None
+
+    request_id = _decode_ascii(raw_values[0])
+    if (
+        request_id is None
+        or _REQUEST_ID.fullmatch(request_id) is None
+        or request_id_overlaps_bearer(authorization_header, request_id)
+    ):
+        return False, None
+    return True, request_id
 
 
 def _is_supported_authorization_header(value: str) -> bool:

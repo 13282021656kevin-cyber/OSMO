@@ -29,6 +29,7 @@ from src.service.mcp import (
     gateway,
     protocol,
     request_context,
+    server,
     tool_registry,
 )
 
@@ -82,19 +83,9 @@ class ProtocolHarness:
         """Build one isolated selected-tool protocol application."""
         mcp_server = protocol.OSMOFastMCP(
             name='OSMO MCP protocol test',
-            host='0.0.0.0',
-            port=8000,
-            streamable_http_path='/mcp',
-            stateless_http=True,
-            json_response=True,
         )
         tool_registry.register_tools(mcp_server, names=self.tool_names)
-        application = mcp_server.streamable_http_app()
-        application.add_middleware(
-            request_context.RequestContextMiddleware,
-            path='/mcp',
-        )
-        return application
+        return server.create_application(mcp_server)
 
     def headers(self) -> dict[str, str]:
         """Return the trusted Gateway headers for one MCP test request."""
