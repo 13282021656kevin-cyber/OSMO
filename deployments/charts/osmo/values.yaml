@@ -12,10 +12,8 @@ planes:
   compute:
     enabled: false
 
-# Select supporting systems managed by this Helm release.
-# TODO: Allow these switches as their dependency charts are added.
-# They must remain false for now; supply operator-managed services through
-# `externalDependencies` instead.
+# Select supporting systems managed by this Helm release. Embedded Valkey is
+# available; the other switches remain reserved for later chart dependencies.
 embeddedDependencies:
   postgresql:
     enabled: false
@@ -26,9 +24,8 @@ embeddedDependencies:
   kaiScheduler:
     enabled: false
 
-# Connection details for dependencies owned outside this release. These
-# endpoints are required by the control plane because embedded dependencies
-# are not implemented yet.
+# Connection details for dependencies owned outside this release. The Valkey
+# endpoint is required only when embedded Valkey is disabled.
 externalDependencies:
   # PostgreSQL stores OSMO control-plane state. Set caExistingSecret when the
   # server certificate is signed by a private CA.
@@ -41,10 +38,10 @@ externalDependencies:
       enabled: false
       caExistingSecret: ''
       caKey: ca.crt
-  # Valkey provides queues, caches, events, and distributed coordination.
-  # When TLS is enabled, caKey must contain a complete trust bundle (including
-  # public/system roots needed by other HTTPS clients), because Python Redis
-  # consumes it through SSL_CERT_FILE.
+  # Valkey provides queues, caches, events, and distributed coordination. TLS
+  # uses the system trust store unless caExistingSecret selects a custom bundle.
+  # When set, caKey must contain the complete trust bundle because clients use
+  # it through SSL_CERT_FILE.
   valkey:
     host: ''
     port: 6379
@@ -67,11 +64,13 @@ externalDependencies:
 nameOverride: ''
 fullnameOverride: ''
 
-# Global image registry and pull credentials. A non-empty registry overrides
-# every component and runtime image registry for air-gapped mirrors.
-global:
-  imageRegistry: ''
-  imagePullSecrets: []
+# A non-empty registry overrides OSMO-owned component and runtime image
+# registries. Configure dependency registries in their native values blocks.
+imageRegistry: ''
+
+# Pull credential Secret references for OSMO-owned pods. Configure dependency
+# pull credentials in the dependency's native values block.
+imagePullSecrets: []
 
 # Runtime images referenced by submitted workflows.
 runtimeImage:
@@ -159,10 +158,9 @@ monitoring:
     relabelings: []
     metricRelabelings: []
 
-# References to operator-owned Kubernetes Secrets. Inline credentials are not
-# accepted.
-# TODO: Implement retained chart-generated credentials for `generate: true`;
-# all `generate` switches must remain false for now.
+# References to Kubernetes Secrets. Inline credentials are not accepted.
+# Generated credentials are supported only for embedded Valkey; every other
+# `generate` switch must remain false.
 secrets:
   # Password used with `externalDependencies.postgresql.username`.
   postgresql:
@@ -170,7 +168,9 @@ secrets:
     existingSecret: ''
     keys:
       password: db-password
-  # Password used for the external Valkey connection.
+  # Password used for the effective Valkey connection. Embedded mode supports
+  # either a retained generated Secret or an existing Secret; external mode
+  # requires an existing Secret.
   valkey:
     generate: false
     existingSecret: ''
@@ -1298,3 +1298,55 @@ configuration:
         default: {}
   backendTests: {}
   groupTemplates: {}
+
+# Official Valkey dependency configuration. These defaults provide an
+# authenticated, persistent standalone primary when embedded Valkey is enabled.
+# The dependency also supports fixed-primary replication for read scaling and
+# data redundancy, but it does not provide Sentinel or automatic promotion.
+valkey:
+  networkPolicy:
+    ingress:
+    - from:
+      - podSelector: {}
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 1
+      memory: 2Gi
+  initResources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+  readinessProbe:
+    enabled: true
+  dataStorage:
+    enabled: true
+    requestedSize: 8Gi
+    keepPvc: true
+  auth:
+    enabled: true
+    usersExistingSecret: '{{ printf "%s-valkey-credentials" .Release.Name | trunc 63 | trimSuffix "-" }}'
+    aclUsers:
+      default:
+        permissions: "~* &* +@all"
+        passwordKey: redis-password
+  valkeyConfig: |
+    appendonly yes
+    appendfsync everysec
+    maxmemory 1gb
+    maxmemory-policy noeviction
+  deploymentStrategy: Recreate
+  replica:
+    minReplicasToWrite: 1
+    persistence:
+      size: 8Gi
+    persistentVolumeClaimRetentionPolicy:
+      whenDeleted: Retain
+      whenScaled: Retain
+  podDisruptionBudget:
+    enabled: true
