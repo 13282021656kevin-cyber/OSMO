@@ -11,7 +11,8 @@ The supported `split-plane-control` profile installs the API, UI, router,
 worker, logger, agent, delayed-job monitor, and standalone OSMO gateway. It
 can create a persistent PostgreSQL cluster through CloudNativePG or connect to
 an external PostgreSQL service, and it can deploy embedded Valkey or connect
-to an external Valkey service. Object storage and the remaining Kubernetes
+to an external Valkey service. Object storage can use an external S3-compatible
+service or the optional embedded RustFS dependency. The remaining Kubernetes
 Secrets are externally managed. Compute-plane workloads and the other embedded
 dependencies remain future work.
 
@@ -177,6 +178,57 @@ automatic primary promotion, multi-zone failover, managed backups, or TLS.
 To use external Valkey, keep `embeddedDependencies.valkey.enabled=false` and
 configure `externalDependencies.valkey` and
 `secrets.valkey.existingSecret` as shown in the installation example.
+
+## Embedded RustFS object storage
+
+Enable embedded object storage with retained generated credentials as follows:
+
+```yaml
+embeddedDependencies:
+  objectStorage:
+    enabled: true
+
+externalDependencies:
+  objectStorage:
+    endpoint: ''
+    buckets:
+      workflows: ''
+      logs: ''
+      apps: ''
+
+secrets:
+  objectStorage:
+    generate: true
+    existingSecret: ''
+
+rustfs:
+  secret:
+    existingSecret: osmo-rustfs-credentials
+```
+
+The chart deploys a standalone RustFS instance with a retained 10 GiB
+`ReadWriteOnce` PVC. A post-install/post-upgrade Job creates the configured
+workflow, log, and app buckets when they are absent. OSMO is configured with
+the RustFS endpoint, buckets, and generated credentials automatically.
+
+The generated `osmo-rustfs-credentials` Secret is retained on uninstall and
+reused on upgrades. To provide an existing Secret, disable
+`secrets.objectStorage.generate` and set both
+`secrets.objectStorage.existingSecret` and
+`rustfs.secret.existingSecret` to its name. The Secret must contain
+`RUSTFS_ACCESS_KEY`, `RUSTFS_SECRET_KEY`, and `object-storage.yaml`; the
+credentials in all three entries must match. Use a unique Secret name for each
+OSMO release in the same namespace.
+
+For a distributed deployment, layer
+[`embedded-rustfs-ha-values.yaml`](embedded-rustfs-ha-values.yaml) after the
+environment values and provide the existing Secret referenced by that file.
+
+To use external object storage, keep
+`embeddedDependencies.objectStorage.enabled=false` and configure
+`externalDependencies.objectStorage` and
+`secrets.objectStorage.existingSecret` as shown in the installation example
+above.
 
 ## Optional configuration
 

@@ -18,7 +18,7 @@ fail() {
     exit 1
 }
 
-for required_command in awk grep helm tar; do
+for required_command in awk base64 grep helm tar; do
     command -v "$required_command" >/dev/null || \
         fail "required command not found: $required_command"
 done
@@ -140,6 +140,18 @@ resource_document() {
                 print "resource not found: " kind "/" name > "/dev/stderr"
                 exit 1
             }
+        }
+    ' "$file"
+}
+
+secret_data_value() {
+    local file=$1
+    local key=$2
+    awk -v key="$key" '
+        $1 == key ":" {
+            gsub(/^"|"$/, "", $2)
+            print $2
+            exit
         }
     ' "$file"
 }
@@ -309,6 +321,10 @@ require_clean_osmo_sources() {
     require_contains "$CHARTS_ROOT/osmo/Chart.yaml" "version: 0.8.0"
     require_contains "$CHARTS_ROOT/osmo/Chart.yaml" \
         "condition: embeddedDependencies.postgresql.enabled"
+    require_contains "$CHARTS_ROOT/osmo/Chart.yaml" "name: rustfs"
+    require_contains "$CHARTS_ROOT/osmo/Chart.yaml" 'version: "1.0.0-rc.2"'
+    require_contains "$CHARTS_ROOT/osmo/Chart.yaml" \
+        "condition: embeddedDependencies.objectStorage.enabled"
     [[ -e "$CHARTS_ROOT/osmo/Chart.lock" ]] || fail "osmo must have a dependency lock"
     require_downloaded_dependencies_untracked
     [[ ! -e "$CHARTS_ROOT/osmo/templates/postgres.yaml" ]] || \
@@ -362,9 +378,24 @@ test_control_umbrella() {
     mkdir -p "$charts_copy"
     cp -R "$CHARTS_ROOT/osmo" "$charts_copy/osmo"
     if ! compgen -G "$charts_copy/osmo/charts/valkey-0.11.0.tgz" >/dev/null || \
-        ! compgen -G "$charts_copy/osmo/charts/cluster-0.8.0.tgz" >/dev/null; then
+        ! compgen -G "$charts_copy/osmo/charts/cluster-0.8.0.tgz" >/dev/null || \
+        ! compgen -G "$charts_copy/osmo/charts/rustfs-1.0.0-rc.2.tgz" >/dev/null; then
         helm dependency build "$charts_copy/osmo" >/dev/null
     fi
+    local rustfs_archive_verifier="$charts_copy/osmo/tests/verify_rustfs_chart_archive.sh"
+    local rustfs_archive="$charts_copy/osmo/charts/rustfs-1.0.0-rc.2.tgz"
+    [[ -f "$rustfs_archive_verifier" ]] || \
+        fail "RustFS chart archive verifier is required"
+    bash "$rustfs_archive_verifier" "$rustfs_archive" >/dev/null
+    local altered_rustfs_archive="$TEST_DIRECTORY/altered-rustfs-1.0.0-rc.2.tgz"
+    cp "$rustfs_archive" "$altered_rustfs_archive"
+    printf 'altered archive\n' >>"$altered_rustfs_archive"
+    if bash "$rustfs_archive_verifier" "$altered_rustfs_archive" \
+        >"$TEST_DIRECTORY/altered-rustfs-archive.out" 2>&1; then
+        fail "expected an altered RustFS chart archive to fail digest verification"
+    fi
+    require_contains "$TEST_DIRECTORY/altered-rustfs-archive.out" \
+        "RustFS chart archive SHA-256 mismatch:"
 
     if ! helm lint "$charts_copy/osmo" >"$TEST_DIRECTORY/osmo-lint.out" 2>&1; then
         cat "$TEST_DIRECTORY/osmo-lint.out" >&2
@@ -384,6 +415,12 @@ test_control_umbrella() {
         ! grep -Fq "osmo/charts/cluster-0.8.0.tgz" \
         "$TEST_DIRECTORY/osmo-package.txt"; then
         fail "packaged OSMO chart does not contain CloudNativePG cluster 0.8.0"
+    fi
+    if ! grep -Fq "osmo/charts/rustfs/Chart.yaml" \
+        "$TEST_DIRECTORY/osmo-package.txt" && \
+        ! grep -Fq "osmo/charts/rustfs-1.0.0-rc.2.tgz" \
+        "$TEST_DIRECTORY/osmo-package.txt"; then
+        fail "packaged OSMO chart does not contain RustFS 1.0.0-rc.2"
     fi
     require_not_contains "$TEST_DIRECTORY/osmo-package.txt" "osmo/tests/"
     require_not_contains "$TEST_DIRECTORY/osmo-package.txt" "osmo/migrations/"
@@ -471,6 +508,20 @@ test_control_umbrella() {
     require_contains "$rendered" "secretName: external-object-storage-secret"
     require_contains "$rendered" "secretName: external-master-encryption-key-secret"
     require_contains "$rendered" "https://s3.external.example.com"
+    resource_document "$rendered" ConfigMap osmo-api-config \
+        >"$TEST_DIRECTORY/osmo-external-object-storage-config.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-external-object-storage-config.yaml" \
+        "override_url: https://s3.external.example.com"
+    require_contains "$TEST_DIRECTORY/osmo-external-object-storage-config.yaml" \
+        "region: us-east-1"
+    require_contains "$TEST_DIRECTORY/osmo-external-object-storage-config.yaml" \
+        "endpoint: s3://osmo-workflows/workflows"
+    require_contains "$TEST_DIRECTORY/osmo-external-object-storage-config.yaml" \
+        "endpoint: s3://osmo-logs/logs"
+    require_contains "$TEST_DIRECTORY/osmo-external-object-storage-config.yaml" \
+        "endpoint: s3://osmo-apps/apps"
+    require_contains "$TEST_DIRECTORY/osmo-external-object-storage-config.yaml" \
+        "secretKey: object-storage.yaml"
     require_contains "$rendered" "nvcr.io/nvidia/osmo/service:6.3.1"
     require_contains "$rendered" "- INFO"
     require_contains "$rendered" "service_base_url: http://osmo-gateway"
@@ -857,6 +908,691 @@ EOF
         >"$TEST_DIRECTORY/osmo-ui.yaml"
     require_contains "$TEST_DIRECTORY/osmo-ui.yaml" \
         "serviceAccountName: default"
+    require_no_resource "$rendered" ConfigMap "osmo-object-storage-bootstrap"
+    require_no_resource "$rendered" Job "osmo-object-storage-bootstrap"
+
+    local embedded_object_storage_settings=(
+        --set embeddedDependencies.objectStorage.enabled=true
+        --set-string externalDependencies.objectStorage.endpoint=
+        --set-string externalDependencies.objectStorage.buckets.workflows=
+        --set-string externalDependencies.objectStorage.buckets.logs=
+        --set-string externalDependencies.objectStorage.buckets.apps=
+        --set secrets.objectStorage.generate=true
+        --set-string secrets.objectStorage.existingSecret=
+    )
+
+    helm_template embedded-object-storage "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        >"$TEST_DIRECTORY/osmo-embedded-object-storage.yaml"
+
+    require_deployment "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        embedded-object-storage-rustfs
+    require_resource "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" Service \
+        embedded-object-storage-rustfs-svc
+    require_resource "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        PersistentVolumeClaim embedded-object-storage-rustfs-data
+    require_resource "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" Secret \
+        osmo-rustfs-credentials
+    require_resource "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" ConfigMap \
+        embedded-object-storage-osmo-object-storage-bootstrap
+    require_resource "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" Job \
+        embedded-object-storage-osmo-object-storage-bootstrap
+    require_occurrences "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        "kind: Secret" 1
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        Secret osmo-rustfs-credentials \
+        >"$TEST_DIRECTORY/osmo-rustfs-secret.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-secret.yaml" \
+        "helm.sh/resource-policy: keep"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-secret.yaml" \
+        "RUSTFS_ACCESS_KEY:"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-secret.yaml" \
+        "RUSTFS_SECRET_KEY:"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-secret.yaml" \
+        "object-storage.yaml:"
+    local rustfs_access_key
+    local rustfs_secret_key
+    local rustfs_credentials
+    rustfs_access_key=$(secret_data_value \
+        "$TEST_DIRECTORY/osmo-rustfs-secret.yaml" RUSTFS_ACCESS_KEY | \
+        base64 --decode)
+    rustfs_secret_key=$(secret_data_value \
+        "$TEST_DIRECTORY/osmo-rustfs-secret.yaml" RUSTFS_SECRET_KEY | \
+        base64 --decode)
+    rustfs_credentials=$(secret_data_value \
+        "$TEST_DIRECTORY/osmo-rustfs-secret.yaml" object-storage.yaml | \
+        base64 --decode)
+    [[ "${#rustfs_access_key}" -eq 20 ]] || \
+        fail "expected a 20-character generated RustFS access key"
+    [[ "${#rustfs_secret_key}" -eq 64 ]] || \
+        fail "expected a 64-character generated RustFS secret key"
+    [[ "$rustfs_credentials" == *"access_key_id: $rustfs_access_key"* ]] || \
+        fail "expected OSMO credentials to use the generated RustFS access key"
+    [[ "$rustfs_credentials" == *"access_key: $rustfs_secret_key"* ]] || \
+        fail "expected OSMO credentials to use the generated RustFS secret key"
+    [[ "$rustfs_credentials" == *"addressing_style: path"* ]] || \
+        fail "expected generated OSMO credentials to use path-style addressing"
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        ConfigMap embedded-object-storage-osmo-object-storage-bootstrap \
+        >"$TEST_DIRECTORY/osmo-object-storage-bootstrap-configmap.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-configmap.yaml" \
+        "object-storage-bootstrap.sh:"
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        Job embedded-object-storage-osmo-object-storage-bootstrap \
+        >"$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "helm.sh/hook: post-install,post-upgrade"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "backoffLimit: 3"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "amazon/aws-cli:2.31.13@sha256:e14216fb361cce909ce199616711ad103182d5937f851cda9bebf25867d7180a"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "name: AWS_ACCESS_KEY_ID"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "name: AWS_SECRET_ACCESS_KEY"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "name: osmo-rustfs-credentials"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "key: RUSTFS_ACCESS_KEY"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "key: RUSTFS_SECRET_KEY"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "name: AWS_ENDPOINT_URL"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        'value: "http://embedded-object-storage-rustfs-svc:9000"'
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "name: AWS_DEFAULT_REGION"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        'value: "us-east-1"'
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "name: OSMO_WORKFLOW_BUCKET"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "name: OSMO_LOG_BUCKET"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "name: OSMO_APP_BUCKET"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "name: OSMO_STORAGE_BOOTSTRAP_ATTEMPTS"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "automountServiceAccountToken: false"
+    require_not_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "serviceAccountName:"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "mountPath: /tmp"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "type: RuntimeDefault"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "runAsUser: 10001"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "runAsNonRoot: true"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "readOnlyRootFilesystem: true"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "allowPrivilegeEscalation: false"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "- ALL"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "resources:"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "cpu: 10m"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "memory: 32Mi"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "cpu: 100m"
+    require_contains "$TEST_DIRECTORY/osmo-object-storage-bootstrap-job.yaml" \
+        "memory: 128Mi"
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        Deployment embedded-object-storage-rustfs \
+        >"$TEST_DIRECTORY/osmo-rustfs-deployment.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" "type: Recreate"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" \
+        "runAsNonRoot: true"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" \
+        "readOnlyRootFilesystem: true"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" \
+        "allowPrivilegeEscalation: false"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" "- ALL"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" \
+        "type: RuntimeDefault"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" \
+        "fsGroupChangePolicy: OnRootMismatch"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" "livenessProbe:"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" "readinessProbe:"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" "resources:"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" "cpu: 500m"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" "memory: 1Gi"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" "cpu: 1"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" "memory: 2Gi"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" \
+        "rustfs/rustfs:1.0.0-rc.2@sha256:7d6d361c49c08d427250fb59aae5d78df83d644c3405d9ccf4b21cda0b0692d0"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-deployment.yaml" \
+        "busybox:stable@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662"
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        ConfigMap embedded-object-storage-rustfs-config \
+        >"$TEST_DIRECTORY/osmo-rustfs-config.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-config.yaml" \
+        'RUSTFS_REGION: "us-east-1"'
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        ServiceAccount embedded-object-storage-rustfs \
+        >"$TEST_DIRECTORY/osmo-rustfs-service-account.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-service-account.yaml" \
+        "automountServiceAccountToken: false"
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        PersistentVolumeClaim embedded-object-storage-rustfs-data \
+        >"$TEST_DIRECTORY/osmo-rustfs-pvc.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-pvc.yaml" \
+        "helm.sh/resource-policy: keep"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-pvc.yaml" "ReadWriteOnce"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-pvc.yaml" "storage: 10Gi"
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        ConfigMap embedded-object-storage-osmo-api-config \
+        >"$TEST_DIRECTORY/osmo-embedded-object-storage-config.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-object-storage-config.yaml" \
+        "override_url: http://embedded-object-storage-rustfs-svc:9000"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-object-storage-config.yaml" \
+        "endpoint: s3://osmo-workflows/workflows"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-object-storage-config.yaml" \
+        "endpoint: s3://osmo-logs/logs"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-object-storage-config.yaml" \
+        "endpoint: s3://osmo-apps/apps"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-object-storage-config.yaml" \
+        "secretName: osmo-rustfs-credentials"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-object-storage-config.yaml" \
+        "secretKey: object-storage.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-object-storage-config.yaml" \
+        "region: us-east-1"
+    local object_storage_consumer
+    for object_storage_consumer in api worker logger agent; do
+        resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+            Deployment "embedded-object-storage-osmo-$object_storage_consumer" \
+            >"$TEST_DIRECTORY/osmo-$object_storage_consumer-object-storage.yaml"
+        require_contains \
+            "$TEST_DIRECTORY/osmo-$object_storage_consumer-object-storage.yaml" \
+            "secretName: osmo-rustfs-credentials"
+        require_contains \
+            "$TEST_DIRECTORY/osmo-$object_storage_consumer-object-storage.yaml" \
+            "mountPath: /etc/osmo/secrets/osmo-rustfs-credentials"
+    done
+    require_not_contains "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        "kind: Ingress"
+    require_not_contains "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        "kind: Gateway"
+    require_not_contains "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        "kind: HTTPRoute"
+    require_not_contains "$TEST_DIRECTORY/osmo-embedded-object-storage.yaml" \
+        "kind: HTTPProxy"
+
+    helm_template embedded-non-default-region "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        --set-string embeddedDependencies.objectStorage.region=us-west-2 \
+        --set-string rustfs.config.rustfs.region=us-west-2 \
+        >"$TEST_DIRECTORY/osmo-embedded-non-default-region.yaml"
+    resource_document "$TEST_DIRECTORY/osmo-embedded-non-default-region.yaml" \
+        ConfigMap embedded-non-default-region-rustfs-config \
+        >"$TEST_DIRECTORY/osmo-rustfs-non-default-region-config.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-non-default-region-config.yaml" \
+        'RUSTFS_REGION: "us-west-2"'
+    resource_document "$TEST_DIRECTORY/osmo-embedded-non-default-region.yaml" \
+        ConfigMap embedded-non-default-region-osmo-api-config \
+        >"$TEST_DIRECTORY/osmo-non-default-region-config.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-non-default-region-config.yaml" \
+        "region: us-west-2"
+    resource_document "$TEST_DIRECTORY/osmo-embedded-non-default-region.yaml" \
+        Job embedded-non-default-region-osmo-object-storage-bootstrap \
+        >"$TEST_DIRECTORY/osmo-non-default-region-bootstrap-job.yaml"
+    require_contains \
+        "$TEST_DIRECTORY/osmo-non-default-region-bootstrap-job.yaml" \
+        'value: "us-west-2"'
+
+    helm_template embedded-object-storage-custom-key "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        --set-string secrets.objectStorage.keys.credentials=custom-storage.yaml \
+        --set-string rustfs.secret.existingSecret=custom-rustfs-credentials \
+        >"$TEST_DIRECTORY/osmo-embedded-object-storage-custom-key.yaml"
+    resource_document \
+        "$TEST_DIRECTORY/osmo-embedded-object-storage-custom-key.yaml" Secret \
+        custom-rustfs-credentials \
+        >"$TEST_DIRECTORY/osmo-rustfs-custom-key-secret.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-custom-key-secret.yaml" \
+        "custom-storage.yaml:"
+    require_not_contains "$TEST_DIRECTORY/osmo-rustfs-custom-key-secret.yaml" \
+        "object-storage.yaml:"
+    require_contains \
+        "$TEST_DIRECTORY/osmo-embedded-object-storage-custom-key.yaml" \
+        "secretKey: custom-storage.yaml"
+    require_contains \
+        "$TEST_DIRECTORY/osmo-embedded-object-storage-custom-key.yaml" \
+        "secretName: custom-rustfs-credentials"
+
+    helm_template embedded-object-storage-existing "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        --set secrets.objectStorage.generate=false \
+        --set-string secrets.objectStorage.existingSecret=existing-rustfs-secret \
+        --set-string rustfs.secret.existingSecret=existing-rustfs-secret \
+        >"$TEST_DIRECTORY/osmo-embedded-object-storage-existing.yaml"
+    require_no_resource "$TEST_DIRECTORY/osmo-embedded-object-storage-existing.yaml" \
+        Secret existing-rustfs-secret
+    require_contains "$TEST_DIRECTORY/osmo-embedded-object-storage-existing.yaml" \
+        "secretName: existing-rustfs-secret"
+
+    helm_template embedded-object-storage-ha "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        -f "$CHARTS_ROOT/osmo/embedded-rustfs-ha-values.yaml" \
+        >"$TEST_DIRECTORY/osmo-embedded-object-storage-ha.yaml"
+    require_no_deployment \
+        "$TEST_DIRECTORY/osmo-embedded-object-storage-ha.yaml" \
+        embedded-object-storage-ha-rustfs
+    require_no_resource "$TEST_DIRECTORY/osmo-embedded-object-storage-ha.yaml" \
+        PersistentVolumeClaim embedded-object-storage-ha-rustfs-data
+    require_resource "$TEST_DIRECTORY/osmo-embedded-object-storage-ha.yaml" \
+        StatefulSet embedded-object-storage-ha-rustfs
+    require_resource "$TEST_DIRECTORY/osmo-embedded-object-storage-ha.yaml" \
+        PodDisruptionBudget embedded-object-storage-ha-rustfs
+    require_no_resource "$TEST_DIRECTORY/osmo-embedded-object-storage-ha.yaml" \
+        Secret osmo-rustfs-credentials
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage-ha.yaml" \
+        StatefulSet embedded-object-storage-ha-rustfs \
+        >"$TEST_DIRECTORY/osmo-rustfs-ha-statefulset.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-statefulset.yaml" \
+        "replicas: 4"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-statefulset.yaml" \
+        "requiredDuringSchedulingIgnoredDuringExecution:"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-statefulset.yaml" \
+        "topologyKey: kubernetes.io/hostname"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-statefulset.yaml" \
+        "name: data"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-statefulset.yaml" \
+        'accessModes: ["ReadWriteOnce"]'
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-statefulset.yaml" \
+        "storageClassName: standard"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-statefulset.yaml" \
+        "storage: 100Gi"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-statefulset.yaml" \
+        "name: RUSTFS_LOCAL_ENDPOINT_HOST"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-statefulset.yaml" \
+        "cpu: 500m"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-statefulset.yaml" \
+        "memory: 1Gi"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-statefulset.yaml" \
+        "memory: 2Gi"
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage-ha.yaml" \
+        PodDisruptionBudget embedded-object-storage-ha-rustfs \
+        >"$TEST_DIRECTORY/osmo-rustfs-ha-pdb.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-pdb.yaml" \
+        "maxUnavailable: 1"
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage-ha.yaml" \
+        ConfigMap embedded-object-storage-ha-rustfs-config \
+        >"$TEST_DIRECTORY/osmo-rustfs-ha-config.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-config.yaml" \
+        'RUSTFS_STORAGE_CLASS_STANDARD: "EC:2"'
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-config.yaml" \
+        'rustfs-{0...3}.embedded-object-storage-ha-rustfs-headless.default.svc.cluster.local:9000/data'
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage-ha.yaml" \
+        ConfigMap embedded-object-storage-ha-osmo-api-config \
+        >"$TEST_DIRECTORY/osmo-rustfs-ha-osmo-config.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-osmo-config.yaml" \
+        "override_url: http://embedded-object-storage-ha-rustfs-svc:9000"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-osmo-config.yaml" \
+        "endpoint: s3://osmo-workflows/workflows"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-osmo-config.yaml" \
+        "endpoint: s3://osmo-logs/logs"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-osmo-config.yaml" \
+        "endpoint: s3://osmo-apps/apps"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-osmo-config.yaml" \
+        "secretName: osmo-rustfs-credentials"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-osmo-config.yaml" \
+        "secretKey: object-storage.yaml"
+
+    resource_document "$TEST_DIRECTORY/osmo-embedded-object-storage-ha.yaml" \
+        Job embedded-object-storage-ha-osmo-object-storage-bootstrap \
+        >"$TEST_DIRECTORY/osmo-rustfs-ha-bootstrap-job.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-bootstrap-job.yaml" \
+        'value: "http://embedded-object-storage-ha-rustfs-svc:9000"'
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-bootstrap-job.yaml" \
+        "name: OSMO_WORKFLOW_BUCKET"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-bootstrap-job.yaml" \
+        "name: OSMO_LOG_BUCKET"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-bootstrap-job.yaml" \
+        "name: OSMO_APP_BUCKET"
+    require_contains "$TEST_DIRECTORY/osmo-rustfs-ha-bootstrap-job.yaml" \
+        "name: osmo-rustfs-credentials"
+
+    if helm_template mismatched-embedded-object-storage-region \
+        "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        --set-string embeddedDependencies.objectStorage.region=us-west-2 \
+        >"$TEST_DIRECTORY/mismatched-embedded-object-storage-region.out" 2>&1; then
+        fail "expected mismatched embedded object-storage regions to fail"
+    fi
+    require_contains \
+        "$TEST_DIRECTORY/mismatched-embedded-object-storage-region.out" \
+        "embeddedDependencies.objectStorage.region must match rustfs.config.rustfs.region"
+
+    local conflicting_external_object_storage_value
+    local conflicting_external_object_storage_message
+    while IFS='|' read -r conflicting_external_object_storage_value \
+        conflicting_external_object_storage_message; do
+        if helm_template conflicting-object-storage "$charts_copy/osmo" \
+            -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+            -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+            "${embedded_object_storage_settings[@]}" \
+            --set-string "$conflicting_external_object_storage_value" \
+            >"$TEST_DIRECTORY/conflicting-object-storage.out" 2>&1; then
+            fail "expected embedded and external object-storage configuration to fail"
+        fi
+        require_contains "$TEST_DIRECTORY/conflicting-object-storage.out" \
+            "$conflicting_external_object_storage_message"
+    done <<'EOF'
+externalDependencies.objectStorage.endpoint=https://unexpected.example.com|externalDependencies.objectStorage.endpoint must be empty
+externalDependencies.objectStorage.buckets.workflows=unexpected-workflows|externalDependencies.objectStorage.buckets.workflows must be empty
+externalDependencies.objectStorage.buckets.logs=unexpected-logs|externalDependencies.objectStorage.buckets.logs must be empty
+externalDependencies.objectStorage.buckets.apps=unexpected-apps|externalDependencies.objectStorage.buckets.apps must be empty
+EOF
+
+    if helm_template duplicate-object-storage-credentials "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        --set-string secrets.objectStorage.existingSecret=existing-rustfs-secret \
+        >"$TEST_DIRECTORY/duplicate-object-storage-credentials.out" 2>&1; then
+        fail "expected duplicate embedded object-storage credential ownership to fail"
+    fi
+    require_contains "$TEST_DIRECTORY/duplicate-object-storage-credentials.out" \
+        "generate and existingSecret are mutually exclusive"
+
+    local invalid_object_storage_credentials_key
+    local invalid_object_storage_credentials_key_message
+    while IFS='|' read -r invalid_object_storage_credentials_key \
+        invalid_object_storage_credentials_key_message; do
+        if helm_template invalid-object-storage-credentials-key \
+            "$charts_copy/osmo" \
+            -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+            -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+            "${embedded_object_storage_settings[@]}" \
+            --set-string "$invalid_object_storage_credentials_key" \
+            >"$TEST_DIRECTORY/invalid-object-storage-credentials-key.out" \
+            2>&1; then
+            fail "expected invalid object-storage credentials key to fail"
+        fi
+        require_contains \
+            "$TEST_DIRECTORY/invalid-object-storage-credentials-key.out" \
+            "$invalid_object_storage_credentials_key_message"
+    done <<'EOF'
+secrets.objectStorage.keys.credentials=|must be a non-empty valid Kubernetes Secret data key
+secrets.objectStorage.keys.credentials=object/storage.yaml|must be a non-empty valid Kubernetes Secret data key
+secrets.objectStorage.keys.credentials=RUSTFS_ACCESS_KEY|must not use a reserved RustFS key name
+secrets.objectStorage.keys.credentials=RUSTFS_SECRET_KEY|must not use a reserved RustFS key name
+EOF
+
+    if helm_template missing-object-storage-credentials "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        --set secrets.objectStorage.generate=false \
+        >"$TEST_DIRECTORY/missing-object-storage-credentials.out" 2>&1; then
+        fail "expected missing embedded object-storage credentials to fail"
+    fi
+    require_contains "$TEST_DIRECTORY/missing-object-storage-credentials.out" \
+        "requires generated or existing credentials"
+
+    if helm_template generated-external-object-storage "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        --set secrets.objectStorage.generate=true \
+        --set-string secrets.objectStorage.existingSecret= \
+        >"$TEST_DIRECTORY/generated-external-object-storage.out" 2>&1; then
+        fail "expected generated credentials outside embedded object storage to fail"
+    fi
+    require_contains "$TEST_DIRECTORY/generated-external-object-storage.out" \
+        "secrets.objectStorage.generate is supported only when embedded object storage is enabled"
+
+    if helm_template mismatched-object-storage-secret "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        --set secrets.objectStorage.generate=false \
+        --set-string secrets.objectStorage.existingSecret=existing-rustfs-secret \
+        >"$TEST_DIRECTORY/mismatched-object-storage-secret.out" 2>&1; then
+        fail "expected mismatched embedded object-storage Secret names to fail"
+    fi
+    require_contains "$TEST_DIRECTORY/mismatched-object-storage-secret.out" \
+        "rustfs.secret.existingSecret must match the effective object-storage Secret"
+
+    local inline_rustfs_credential
+    for inline_rustfs_credential in access_key secret_key; do
+        if helm_template inline-rustfs-credential "$charts_copy/osmo" \
+            -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+            -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+            "${embedded_object_storage_settings[@]}" \
+            --set-string "rustfs.secret.rustfs.$inline_rustfs_credential=plaintext" \
+            >"$TEST_DIRECTORY/inline-rustfs-credential.out" 2>&1; then
+            fail "expected inline RustFS $inline_rustfs_credential to fail"
+        fi
+        require_contains "$TEST_DIRECTORY/inline-rustfs-credential.out" \
+            "inline RustFS credentials are not supported"
+    done
+
+    if helm_template both-rustfs-topologies "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        --set rustfs.mode.distributed.enabled=true \
+        --set rustfs.replicaCount=2 \
+        >"$TEST_DIRECTORY/both-rustfs-topologies.out" 2>&1; then
+        fail "expected both RustFS topology modes to fail"
+    fi
+    require_contains "$TEST_DIRECTORY/both-rustfs-topologies.out" \
+        "exactly one RustFS topology mode must be enabled"
+
+    if helm_template neither-rustfs-topology "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        --set rustfs.mode.standalone.enabled=false \
+        >"$TEST_DIRECTORY/neither-rustfs-topology.out" 2>&1; then
+        fail "expected neither RustFS topology mode to fail"
+    fi
+    require_contains "$TEST_DIRECTORY/neither-rustfs-topology.out" \
+        "exactly one RustFS topology mode must be enabled"
+
+    local longest_legal_helm_release
+    longest_legal_helm_release=$(printf 'r%.0s' {1..53})
+    if helm_template "$longest_legal_helm_release" "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        >"$TEST_DIRECTORY/standalone-rustfs-name-overflow.out" 2>&1; then
+        fail "expected an overlong standalone RustFS Service name to fail"
+    fi
+    require_contains "$TEST_DIRECTORY/standalone-rustfs-name-overflow.out" \
+        "standalone embedded RustFS fullname must be at most 59 characters"
+
+    local distributed_rustfs_name_overflow_release
+    distributed_rustfs_name_overflow_release=$(printf 'd%.0s' {1..48})
+    if helm_template "$distributed_rustfs_name_overflow_release" \
+        "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        --set rustfs.mode.standalone.enabled=false \
+        --set rustfs.mode.distributed.enabled=true \
+        --set rustfs.replicaCount=2 \
+        >"$TEST_DIRECTORY/distributed-rustfs-name-overflow.out" 2>&1; then
+        fail "expected an overlong distributed RustFS headless Service name to fail"
+    fi
+    require_contains "$TEST_DIRECTORY/distributed-rustfs-name-overflow.out" \
+        "distributed embedded RustFS fullname must be at most 54 characters"
+
+    local standalone_rustfs_name_boundary_release
+    local standalone_rustfs_name_boundary_fullname
+    standalone_rustfs_name_boundary_release=$(printf 's%.0s' {1..52})
+    standalone_rustfs_name_boundary_fullname="${standalone_rustfs_name_boundary_release}-rustfs"
+    helm_template "$standalone_rustfs_name_boundary_release" \
+        "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        >"$TEST_DIRECTORY/standalone-rustfs-name-boundary.yaml"
+    require_resource "$TEST_DIRECTORY/standalone-rustfs-name-boundary.yaml" \
+        Service "${standalone_rustfs_name_boundary_fullname}-svc"
+
+    local distributed_rustfs_name_boundary_release
+    local distributed_rustfs_name_boundary_fullname
+    distributed_rustfs_name_boundary_release=$(printf 'd%.0s' {1..47})
+    distributed_rustfs_name_boundary_fullname="${distributed_rustfs_name_boundary_release}-rustfs"
+    helm_template "$distributed_rustfs_name_boundary_release" \
+        "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        --set rustfs.mode.standalone.enabled=false \
+        --set rustfs.mode.distributed.enabled=true \
+        --set rustfs.replicaCount=2 \
+        >"$TEST_DIRECTORY/distributed-rustfs-name-boundary.yaml"
+    require_resource "$TEST_DIRECTORY/distributed-rustfs-name-boundary.yaml" \
+        Service "${distributed_rustfs_name_boundary_fullname}-headless"
+
+    local rustfs_topology
+    local rustfs_name_override
+    local rustfs_name_boundary_length
+    local rustfs_name_overflow_length
+    local rustfs_name_error
+    while IFS='|' read -r rustfs_topology rustfs_name_override \
+        rustfs_name_boundary_length rustfs_name_overflow_length rustfs_name_error; do
+        local rustfs_name_boundary_value
+        local rustfs_name_boundary_effective
+        local rustfs_service_suffix
+        local rustfs_topology_settings=()
+        printf -v rustfs_name_boundary_value '%*s' \
+            "$rustfs_name_boundary_length" ''
+        rustfs_name_boundary_value=${rustfs_name_boundary_value// /x}
+        rustfs_name_boundary_effective=$rustfs_name_boundary_value
+        rustfs_service_suffix=svc
+        if [[ "$rustfs_name_override" == nameOverride ]]; then
+            rustfs_name_boundary_effective="n-$rustfs_name_boundary_value"
+        fi
+        if [[ "$rustfs_topology" == distributed ]]; then
+            rustfs_service_suffix=headless
+            rustfs_topology_settings=(
+                --set rustfs.mode.standalone.enabled=false
+                --set rustfs.mode.distributed.enabled=true
+                --set rustfs.replicaCount=2
+            )
+        fi
+        helm_template n "$charts_copy/osmo" \
+            -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+            -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+            "${embedded_object_storage_settings[@]}" \
+            "${rustfs_topology_settings[@]}" \
+            --set-string "rustfs.$rustfs_name_override=$rustfs_name_boundary_value" \
+            >"$TEST_DIRECTORY/$rustfs_topology-$rustfs_name_override-boundary.yaml"
+        require_resource \
+            "$TEST_DIRECTORY/$rustfs_topology-$rustfs_name_override-boundary.yaml" \
+            Service "${rustfs_name_boundary_effective}-${rustfs_service_suffix}"
+
+        local rustfs_name_overflow_value
+        printf -v rustfs_name_overflow_value '%*s' \
+            "$rustfs_name_overflow_length" ''
+        rustfs_name_overflow_value=${rustfs_name_overflow_value// /x}
+        if helm_template n "$charts_copy/osmo" \
+            -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+            -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+            "${embedded_object_storage_settings[@]}" \
+            "${rustfs_topology_settings[@]}" \
+            --set-string "rustfs.$rustfs_name_override=$rustfs_name_overflow_value" \
+            >"$TEST_DIRECTORY/$rustfs_topology-$rustfs_name_override-overflow.out" 2>&1; then
+            fail "expected overlong $rustfs_topology rustfs.$rustfs_name_override to fail"
+        fi
+        require_contains \
+            "$TEST_DIRECTORY/$rustfs_topology-$rustfs_name_override-overflow.out" \
+            "$rustfs_name_error"
+    done <<'EOF'
+standalone|fullnameOverride|59|60|standalone embedded RustFS fullname must be at most 59 characters
+standalone|nameOverride|57|58|standalone embedded RustFS fullname must be at most 59 characters
+distributed|fullnameOverride|54|55|distributed embedded RustFS fullname must be at most 54 characters
+distributed|nameOverride|52|53|distributed embedded RustFS fullname must be at most 54 characters
+EOF
+
+    if helm_template unsupported-rustfs-port "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        "${embedded_object_storage_settings[@]}" \
+        --set rustfs.service.endpoint.port=9002 \
+        >"$TEST_DIRECTORY/unsupported-rustfs-port.out" 2>&1; then
+        fail "expected a non-9000 RustFS endpoint port to fail"
+    fi
+    require_contains "$TEST_DIRECTORY/unsupported-rustfs-port.out" \
+        "embedded RustFS requires endpoint service port 9000"
+
+    local exposed_rustfs_value
+    local exposed_rustfs_message
+    while IFS='|' read -r exposed_rustfs_value exposed_rustfs_message; do
+        if helm_template exposed-rustfs "$charts_copy/osmo" \
+            -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+            -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+            "${embedded_object_storage_settings[@]}" \
+            --set "$exposed_rustfs_value" \
+            >"$TEST_DIRECTORY/exposed-rustfs.out" 2>&1; then
+            fail "expected exposed RustFS endpoint to fail"
+        fi
+        require_contains "$TEST_DIRECTORY/exposed-rustfs.out" \
+            "$exposed_rustfs_message"
+    done <<'EOF'
+rustfs.ingress.enabled=true|rustfs.ingress.enabled must be false
+rustfs.ingress.className=contour|rustfs.ingress.className must not be contour
+rustfs.gatewayApi.enabled=true|rustfs.gatewayApi.enabled must be false
+rustfs.mtls.enabled=true|rustfs.mtls.enabled must be false
+rustfs.service.type=NodePort|rustfs.service.type must be ClusterIP
+rustfs.service.externalIPs[0]=192.0.2.10|rustfs.service.externalIPs must be empty
+rustfs.service.loadBalancerIP=192.0.2.10|rustfs.service.loadBalancerIP must be empty
+rustfs.service.loadBalancerClass=example.com/lb|rustfs.service.loadBalancerClass must be empty
+rustfs.service.loadBalancerSourceRanges[0]=192.0.2.0/24|rustfs.service.loadBalancerSourceRanges must be empty
+EOF
+
+    local invalid_embedded_bucket_value
+    local invalid_embedded_bucket_message
+    while IFS='|' read -r invalid_embedded_bucket_value \
+        invalid_embedded_bucket_message; do
+        if helm_template invalid-embedded-bucket "$charts_copy/osmo" \
+            -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+            -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+            "${embedded_object_storage_settings[@]}" \
+            --set-string "$invalid_embedded_bucket_value" \
+            >"$TEST_DIRECTORY/invalid-embedded-bucket.out" 2>&1; then
+            fail "expected invalid embedded object-storage bucket to fail"
+        fi
+        require_contains "$TEST_DIRECTORY/invalid-embedded-bucket.out" \
+            "$invalid_embedded_bucket_message"
+    done <<'EOF'
+embeddedDependencies.objectStorage.buckets.workflows=|embedded object-storage bucket names must be non-empty
+embeddedDependencies.objectStorage.buckets.logs=osmo-workflows|embedded object-storage bucket names must be unique
+embeddedDependencies.objectStorage.buckets.apps=OSMO-APPS|embedded object-storage bucket names must use valid S3 syntax
+embeddedDependencies.objectStorage.buckets.apps=osmo_apps|embedded object-storage bucket names must use valid S3 syntax
+EOF
 
     helm_template osmo "$charts_copy/osmo" \
         -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
@@ -2288,6 +3024,26 @@ EOF
         "curl http://127.0.0.1:8080/api/version"
     require_not_contains "$TEST_DIRECTORY/osmo-http-notes-configmap.yaml" \
         "--insecure"
+
+    helm_template notes-embedded-release "$charts_copy/osmo" \
+        -f "$charts_copy/osmo/profiles/split-plane-control.yaml" \
+        -f "$CHARTS_ROOT/osmo/tests/control-external-values.yaml" \
+        -f "$CHARTS_ROOT/osmo/embedded-rustfs-ha-values.yaml" \
+        >"$TEST_DIRECTORY/osmo-embedded-notes.yaml"
+    resource_document "$TEST_DIRECTORY/osmo-embedded-notes.yaml" ConfigMap \
+        rendered-notes >"$TEST_DIRECTORY/osmo-embedded-notes-configmap.yaml"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-notes-configmap.yaml" \
+        "http://notes-embedded-release-rustfs-svc:9000"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-notes-configmap.yaml" \
+        "osmo-rustfs-credentials"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-notes-configmap.yaml" \
+        "PersistentVolumeClaims are retained"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-notes-configmap.yaml" \
+        "restore the matching credential Secret"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-notes-configmap.yaml" \
+        "kubectl get deployment,statefulset,pod,pvc,job"
+    require_contains "$TEST_DIRECTORY/osmo-embedded-notes-configmap.yaml" \
+        "service/notes-embedded-release-osmo-gateway 8080:80"
 
 }
 
