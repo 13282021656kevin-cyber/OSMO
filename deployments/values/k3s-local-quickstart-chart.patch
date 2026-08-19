@@ -1,0 +1,263 @@
+--- a/deployments/charts/quick-start/values.yaml
++++ b/deployments/charts/quick-start/values.yaml
+@@ -27,10 +27,10 @@
+ 
+   ## Node selector constraints for pod scheduling
+   ##
+-  nodeSelector:
+-    ## Schedule pods only on service nodes
+-    ##
+-    node_group: service
++  ## Emptied for single-node k3s: there is only one node, and it cannot carry
++  ## the service/data/compute values of node_group simultaneously.
++  ##
++  nodeSelector: {}
+ 
+   ## Name of the Kubernetes secret containing Docker registry credentials
+   ##
+@@ -129,10 +129,7 @@
+       password: "osmo"
+       ## Node selector constraints for pod scheduling
+       ##
+-      nodeSelector:
+-        ## Schedule pods only on data nodes
+-        ##
+-        node_group: data
++      nodeSelector: {}
+ 
+     ## Redis cache service configuration
+     ##
+@@ -151,10 +148,7 @@
+       tlsEnabled: false
+       ## Node selector constraints for pod scheduling
+       ##
+-      nodeSelector:
+-        ## Schedule pods only on data nodes
+-        ##
+-        node_group: data
++      nodeSelector: {}
+ 
+     ## Localstack S3 Object storage configuration
+     ##
+@@ -175,10 +169,7 @@
+         hostPath: /var/lib/localstack
+       ## Node selector constraints for pod scheduling
+       ##
+-      nodeSelector:
+-        ## Schedule pods only on data nodes
+-        ##
+-        node_group: data
++      nodeSelector: {}
+ 
+     ## Main API service configuration
+     ##
+--- a/deployments/charts/quick-start/templates/config-setup.yaml
++++ b/deployments/charts/quick-start/templates/config-setup.yaml
+@@ -70,7 +70,8 @@
+                     "override_url": "'"${OBJECT_STORAGE_OVERRIDE_URL}"'",
+                     "access_key_id": "'"${OBJECT_STORAGE_ACCESS_KEY_ID}"'",
+                     "access_key": "'"${OBJECT_STORAGE_ACCESS_KEY}"'",
+-                    "region": "'"${OBJECT_STORAGE_REGION}"'"
++                    "region": "'"${OBJECT_STORAGE_REGION}"'",
++                    "addressing_style": "path"
+                   }
+                 },
+                 "workflow_log": {
+@@ -79,7 +80,8 @@
+                     "override_url": "'"${OBJECT_STORAGE_OVERRIDE_URL}"'",
+                     "access_key_id": "'"${OBJECT_STORAGE_ACCESS_KEY_ID}"'",
+                     "access_key": "'"${OBJECT_STORAGE_ACCESS_KEY}"'",
+-                    "region": "'"${OBJECT_STORAGE_REGION}"'"
++                    "region": "'"${OBJECT_STORAGE_REGION}"'",
++                    "addressing_style": "path"
+                   }
+                 },
+                 "workflow_app": {
+@@ -88,7 +90,8 @@
+                     "override_url": "'"${OBJECT_STORAGE_OVERRIDE_URL}"'",
+                     "access_key_id": "'"${OBJECT_STORAGE_ACCESS_KEY_ID}"'",
+                     "access_key": "'"${OBJECT_STORAGE_ACCESS_KEY}"'",
+-                    "region": "'"${OBJECT_STORAGE_REGION}"'"
++                    "region": "'"${OBJECT_STORAGE_REGION}"'",
++                    "addressing_style": "path"
+                   }
+                 },
+                 "backend_images": {
+@@ -156,10 +159,7 @@
+                           }
+                         ]
+                       }
+-                    ],
+-                    "nodeSelector": {
+-                      "node_group": "compute"
+-                    }
++                    ]
+                   }
+                 }
+               },
+@@ -222,6 +222,28 @@
+           done
+           echo "Backend default is now available"
+ 
++          {{- if .Values.observability }}
++          {{- if .Values.observability.grafanaUrl }}
++          echo "Setting backend observability URLs..."
++
++          # generate_grafana_url appends var-namespace / var-uuid / from / to to
++          # this base, so it must point at a dashboard that declares those
++          # variables (the shipped Workflow Resources dashboard does).
++          # The update uses exclude_unset, so only these fields change.
++          curl -s -X POST \
++            -H "Content-Type: application/json" \
++            -H "x-osmo-user: testuser" \
++            "$BASE_URL/api/configs/backend/default" \
++            -d '{
++              "configs": {
++                "grafana_url": "{{ .Values.observability.grafanaUrl }}",
++                "dashboard_url": "{{ .Values.observability.dashboardUrl | default "" }}"
++              },
++              "description": "Set observability URLs"
++            }'
++          {{- end }}
++          {{- end }}
++
+           echo "Setting default pool..."
+ 
+           # Set default pool (POST /api/profile/settings)
+@@ -246,7 +268,8 @@
+                 "access_key": "'"${OBJECT_STORAGE_ACCESS_KEY}"'",
+                 "endpoint": "'"${OBJECT_STORAGE_ENDPOINT}"'",
+                 "override_url": "'"${OBJECT_STORAGE_OVERRIDE_URL}"'",
+-                "region": "'"${OBJECT_STORAGE_REGION}"'"
++                "region": "'"${OBJECT_STORAGE_REGION}"'",
++                "addressing_style": "path"
+               }
+             }'
+ 
+--- a/deployments/charts/quick-start/templates/backend-operator-token-secret.yaml
++++ b/deployments/charts/quick-start/templates/backend-operator-token-secret.yaml
+@@ -59,7 +59,11 @@
+ 
+           apk add --no-cache jq
+ 
+-          BASE_URL="http://osmo-service"
++          # osmo-service runs with --ssl_self_signed, so its port 80 speaks TLS.
++          # The port must be explicit or curl would default to 443, where
++          # nothing listens. -k is needed for the self-signed certificate.
++          BASE_URL="https://osmo-service:80"
++          CURL="curl -sk"
+           echo "Using URL: $BASE_URL"
+ 
+           echo "Checking if secret exists and testing token..."
+@@ -87,11 +91,14 @@
+             echo "DEBUG: Processed token length: $TOKEN_LENGTH"
+ 
+             echo "Testing token validity..."
+-            TOKEN_TEST_RESPONSE=$(curl -s -w "%{http_code}" \
++            # A stale secret makes this request fail; || true keeps set -e from
++            # aborting before the recreate path below can run.
++            TOKEN_TEST_RESPONSE=$($CURL -w "%{http_code}" \
+               -H "Authorization: Bearer $SECRET_TOKEN" \
+               $BASE_URL/api/auth/jwt/access_token \
+               -G --data-urlencode "access_token=$SECRET_TOKEN" \
+-              -o /tmp/token_test.json)
++              -o /tmp/token_test.json || true)
++            touch /tmp/token_test.json
+ 
+             echo "DEBUG: API response code: $TOKEN_TEST_RESPONSE"
+             echo "DEBUG: API response body:"
+@@ -109,7 +116,7 @@
+           fi
+ 
+           echo "Creating service account user backend-operator (if not exists)..."
+-          USER_HTTP_CODE=$(curl -s -o /tmp/user_create.json -w "%{http_code}" \
++          USER_HTTP_CODE=$($CURL -o /tmp/user_create.json -w "%{http_code}" \
+             -X POST \
+             -H "Content-Type: application/json" \
+             $BASE_URL/api/auth/user \
+@@ -125,7 +132,7 @@
+           fi
+ 
+           echo "Deleting service token backend-operator-token..."
+-          curl -s -X DELETE \
++          $CURL -X DELETE \
+             $BASE_URL/api/auth/user/backend-operator/access_token/backend-operator-token
+           echo "Service token deletion attempted"
+ 
+@@ -138,7 +145,7 @@
+           NEXT_YEAR=$((CURRENT_YEAR + 1))
+           EXPIRES_AT="${NEXT_YEAR}-$(date +%m-%d)"
+ 
+-          TOKEN_RESPONSE=$(curl -s \
++          TOKEN_RESPONSE=$($CURL \
+             --max-time 30 \
+             --fail-with-body \
+             -X POST \
+--- a/deployments/charts/service/templates/agent-service.yaml
++++ b/deployments/charts/service/templates/agent-service.yaml
+@@ -132,6 +132,15 @@
+         {{- end }}
+         {{- include "osmo.upstream-tls-args" (dict "context" . "secretName" .Values.gateway.tls.upstreamCerts.agent) | nindent 8 }}
+         env:
++        # Set via env, not argv: agent_service.py loads both
++        # WorkflowServiceConfig (which carries MetricsCreatorConfig) and
++        # BackendServiceConfig (which does not) from the same argv, so a
++        # --metrics_* flag makes the latter abort on an unrecognized argument.
++        # StaticConfig.load reads env with higher priority than argv anyway.
++        - name: METRICS_OTEL_ENABLE
++          value: "true"
++        - name: METRICS_OTEL_COLLECTOR_COMPONENT
++          value: {{ .Values.services.agent.serviceName }}
+         {{- if .Values.services.migration.enabled }}
+         - name: OSMO_SCHEMA_VERSION
+           value: {{ .Values.services.migration.targetSchema }}
+@@ -154,7 +163,6 @@
+               key: redis-password
+         {{- end }}
+         imagePullPolicy: {{ .Values.services.agent.imagePullPolicy }}
+-        ports:
+         {{- if or .Values.services.configFile.enabled .Values.global.logs.enabled .Values.services.configs.enabled .Values.services.agent.extraVolumeMounts (and .Values.gateway.tls.enabled .Values.gateway.tls.upstreamCerts.agent) }}
+         volumeMounts:
+         {{- end }}
+--- a/deployments/charts/service/templates/logger-service.yaml
++++ b/deployments/charts/service/templates/logger-service.yaml
+@@ -79,9 +79,9 @@
+             drop: ["ALL"]
+           runAsNonRoot: true
+           runAsUser: 1001
+-        ports:
+-        - name: metrics
+-          containerPort: 9464
++        # No metrics port: the logger binary has no MetricsCreatorConfig and
++        # never starts a Prometheus endpoint, so declaring 9464 only produces a
++        # scrape target that can never come up.
+         command:
+         - logger
+         args:
+@@ -145,7 +145,6 @@
+               key: redis-password
+         {{- end }}
+         imagePullPolicy: {{ .Values.services.logger.imagePullPolicy }}
+-        ports:
+         {{- if or .Values.services.configFile.enabled .Values.global.logs.enabled .Values.services.configs.enabled .Values.services.logger.extraVolumeMounts (and .Values.gateway.tls.enabled .Values.gateway.tls.upstreamCerts.logger) }}
+         volumeMounts:
+         {{- end }}
+--- a/deployments/charts/service/templates/api-monitor.yaml
++++ b/deployments/charts/service/templates/api-monitor.yaml
+@@ -25,12 +25,15 @@
+     path: /metrics
+   selector:
+     matchExpressions:
++    # The logger is omitted: LoggerServiceConfig does not inherit
++    # MetricsCreatorConfig and logger.py never builds a MetricCreator, so
++    # nothing listens on 9464 and the target would sit permanently down.
++    # Its per-task data lands in the postgres tasks/task_io tables instead.
+     - { key: app,
+         operator: In,
+         values: [{{ .Values.services.agent.serviceName }},
+                  {{ .Values.services.service.serviceName }},
+                  {{ .Values.services.worker.serviceName }},
+-                 {{ .Values.services.logger.serviceName }},
+                  {{ .Values.services.delayedJobMonitor.serviceName }}]
+       }
+ {{- end }}

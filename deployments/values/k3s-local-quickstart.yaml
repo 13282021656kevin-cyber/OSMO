@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Overrides for the 6.3.0 quick-start umbrella chart on a single-node k3s host.
+#
+# Deltas from the chart's own quick-start values:
+#   - osmoImageTag is pinned to 6.3.1, the newest published image. The chart
+#     default of `latest` resolves to a 6.4.0-era build whose entrypoint does
+#     not accept the flags chart 1.3.0 passes.
+#   - storageClassName is local-path (the k3s default) instead of standard.
+#   - The gateway is a LoadBalancer served by k3s servicelb, which binds host
+#     port 80 directly. The chart's NodePort 30080 assumes a KIND host-port
+#     mapping that does not exist here.
+#
+# The node_group selectors cannot be removed from here: Helm deep-merges maps
+# and the charts render selectors with `range`, so neither an empty map nor a
+# null value deletes an inherited key. They are stripped from the staged chart
+# at ~/osmo-k3s/charts/quick-start instead.
+
+global:
+  osmoImageTag: "6.3.1"
+
+service:
+  # Emits the `otel-monitor` PodMonitor so Prometheus scrapes port 9464 on the
+  # service/worker/agent/delayed-job-monitor pods. Requires the
+  # monitoring.coreos.com CRDs — see k3s-local-monitoring.yaml. The logger is
+  # excluded in the patched chart: it cannot export metrics in 6.3.1.
+  podMonitor:
+    enabled: true
+
+  services:
+    postgres:
+      storageClassName: local-path
+
+    redis:
+      storageClassName: local-path
+
+    localstackS3:
+      persistence:
+        storageClassName: local-path
+
+  gateway:
+    envoy:
+      service:
+        type: LoadBalancer
+        nodePort: null
+      defaultIdentity:
+        user: testuser
+        roles: osmo-admin
+        allowedPools: default
+
+backend-operator:
+  # Scrapes port 9464 on the backend-listener and backend-worker pods.
+  podMonitor:
+    enabled: true
+
+# Written onto the `default` backend config, which is what populates the
+# per-task grafana_url / dashboard_url fields returned by /api/task.
+# generate_grafana_url() appends var-namespace, var-uuid, from and to, so this
+# must point at a dashboard declaring those variables — uid `workflow_resources`
+# is the shipped Workflow Resources dashboard.
+observability:
+  grafanaUrl: "http://192.168.5.91:3000/d/workflow_resources/workflow-resources"
