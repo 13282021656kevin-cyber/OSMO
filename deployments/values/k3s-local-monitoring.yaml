@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# kube-prometheus-stack overrides for the single-node k3s host.
+#
+# This provides the three things the OSMO charts assume but do not ship:
+#   - the monitoring.coreos.com CRDs that `podMonitor.enabled: true` needs
+#   - a Prometheus instance to scrape the OSMO pods' port 9464
+#   - Grafana, plus the kube-state-metrics/node-exporter series that the
+#     shipped OSMO dashboards query
+#
+# Install with:
+#   helm upgrade --install monitoring \
+#     prometheus-community/kube-prometheus-stack -n monitoring --create-namespace \
+#     -f deployments/values/k3s-local-monitoring.yaml
+
+# Watch every namespace, not just the release namespace, so the PodMonitors
+# the OSMO chart creates in `osmo` are picked up.
+prometheus:
+  prometheusSpec:
+    podMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+
+    # The dashboards filter on a `cluster` label, which nothing sets on a
+    # single cluster. Stamping it at scrape time makes their variables resolve.
+    externalLabels:
+      cluster: k3s-local
+
+    # 7 days is plenty for a workstation, and this disk has a history of
+    # tripping eviction thresholds.
+    retention: 7d
+    retentionSize: 8GB
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+
+grafana:
+  adminPassword: osmo-admin
+  service:
+    type: LoadBalancer
+    port: 3000
+  persistence:
+    enabled: true
+    storageClassName: local-path
+    size: 2Gi
+  # Serve under /grafana so it can share the host's port-80 gateway later if
+  # wanted; the LoadBalancer above is what this deployment actually uses.
+  sidecar:
+    dashboards:
+      enabled: true
+      searchNamespace: ALL
+      label: grafana_dashboard
+
+# k3s runs the control plane inside a single supervisor process rather than as
+# discrete static pods, so these scrape targets do not exist and would sit
+# permanently down.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+kubeEtcd:
+  enabled: false
+
+alertmanager:
+  enabled: false
+
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi

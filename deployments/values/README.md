@@ -20,6 +20,17 @@ To customize defaults beyond what `--set` covers, edit these files directly.
 | `gpu-pool.yaml` | When GPU nodes are detected (or `--gpu-node-pool`) | Adds `gpu_toleration` pod template + GPU platform on the default pool. |
 | `pod-monitor-on.yaml` | When prometheus-operator CRDs are detected (or `OSMO_POD_MONITOR_ENABLED=true`) | Re-enables PodMonitor scraping. Off by default to avoid CRD-not-installed errors. |
 
+The files below are for a different deployment path — the 6.3.0 `quick-start`
+umbrella chart on a single-node k3s workstation, installed with plain `helm`
+rather than `deploy-osmo-minimal.sh`. See
+[`README-k3s-local.md`](README-k3s-local.md).
+
+| File | Purpose |
+|---|---|
+| `k3s-local-quickstart.yaml` | Values for the `quick-start` umbrella chart: image tag, `local-path` storage, LoadBalancer gateway, PodMonitors, observability URLs. |
+| `k3s-local-monitoring.yaml` | Values for a separate `kube-prometheus-stack` release supplying the CRDs, Prometheus, and Grafana the OSMO charts assume but do not ship. |
+| `k3s-local-quickstart-chart.patch` | Chart fixes that cannot be expressed as values (node-selector removal, token-bootstrap TLS, S3 addressing style, duplicate `ports:` keys). Apply to a checkout of tag `6.3.0`. |
+
 In addition, the storage backend script ([`scripts/configure-storage.sh`](../scripts/configure-storage.sh)) writes a runtime fragment to `scripts/values/.storage-values.yaml` — that file is auto-generated and should not be hand-edited; it carries the workflow credential references for the backend you selected (`minio` / `azure-blob` / `byo`).
 
 ## Layering order
